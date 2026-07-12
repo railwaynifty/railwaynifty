@@ -99,7 +99,12 @@ async function handle(request: NextRequest, context: { params: Promise<{ path?: 
       .replaceAll("'/api/", "'/api/dashboard/api/")
       .replaceAll("`/api/", "`/api/dashboard/api/")
       .replaceAll('href="/"', 'href="/api/dashboard/"');
-    html = html.includes("</body>") ? html.replace("</body>", `${AUDIT_HOOK}</body>`) : html + AUDIT_HOOK;
+    const bodyCloseIndex = html.toLowerCase().lastIndexOf("</body>");
+
+html =
+  bodyCloseIndex >= 0
+    ? `${html.slice(0, bodyCloseIndex)}${AUDIT_HOOK}${html.slice(bodyCloseIndex)}`
+    : html + AUDIT_HOOK;
     return new NextResponse(html, {
       status: response.status,
       headers: {
