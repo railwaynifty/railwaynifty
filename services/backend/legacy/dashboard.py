@@ -435,7 +435,27 @@ def read_symbol_table(symbol, max_timestamps=8):
         raise ValueError("Invalid symbol")
 
     query = f'SELECT * FROM "{symbol}"'
-    df = pd.read_sql(query, ENGINE)
+
+    try:
+        df = pd.read_sql(query, ENGINE)
+    except sqlalchemy.exc.ProgrammingError as exc:
+        # Fresh Railway database: symbol table will be created by the
+        # live worker after its first successful market-hours fetch.
+        if "does not exist" in str(exc).lower():
+            return pd.DataFrame()
+        raise
+
+    if df.empty or "timestamp" not in df.columns:
+        return df
+
+    df["timestamp"] = df["timestamp"].map(normalize_timestamp)
+    timestamps = sorted(
+        df["timestamp"].dropna().unique(),
+        key=parse_timestamp,
+        reverse=True,
+    )
+    keep = set(timestamps[:max_timestamps])
+    return df[df["timestamp"].isin(keep)].copy()
     if df.empty or "timestamp" not in df.columns:
         return df
 
