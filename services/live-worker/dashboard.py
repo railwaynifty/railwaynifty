@@ -14895,7 +14895,7 @@ def get_available_dates_fast(symbol, row_limit=60000):
     try:
         sql = sqlalchemy.text(
             f'SELECT DISTINCT CAST("timestamp" AS DATE) AS trade_date '
-            f'FROM public."{symbol}" '
+            f'FROM "{symbol}" '
             f'ORDER BY trade_date DESC'
         )
         df = pd.read_sql(sql, ENGINE)
@@ -14909,7 +14909,7 @@ def get_available_dates_fast(symbol, row_limit=60000):
         print(f"V11.8.5 date DISTINCT failed for {symbol}: {type(exc).__name__}: {exc}", flush=True)
         try:
             df = pd.read_sql(
-                sqlalchemy.text(f'SELECT "timestamp" FROM public."{symbol}"'),
+                sqlalchemy.text(f'SELECT "timestamp" FROM "{symbol}"'),
                 ENGINE,
             )
             if not df.empty and "timestamp" in df.columns:
@@ -14958,24 +14958,24 @@ def read_symbol_table_for_date_expiry_fast(symbol, trade_date, expiry=None, max_
     attempts = []
     if prefix and variants:
         attempts.append((
-            f'SELECT * FROM public."{symbol}" '
+            f'SELECT * FROM "{symbol}" '
             f'WHERE "timestamp" LIKE :ts_prefix AND "expiryDate" = ANY(:expiries)',
             {"ts_prefix": prefix + "%", "expiries": variants},
         ))
     if variants:
         attempts.append((
-            f'SELECT * FROM public."{symbol}" '
+            f'SELECT * FROM "{symbol}" '
             f'WHERE CAST("timestamp" AS DATE) = CAST(:trade_date AS DATE) '
             f'AND "expiryDate" = ANY(:expiries)',
             {"trade_date": trade_date, "expiries": variants},
         ))
     if prefix:
         attempts.append((
-            f'SELECT * FROM public."{symbol}" WHERE "timestamp" LIKE :ts_prefix',
+            f'SELECT * FROM "{symbol}" WHERE "timestamp" LIKE :ts_prefix',
             {"ts_prefix": prefix + "%"},
         ))
     attempts.append((
-        f'SELECT * FROM public."{symbol}" WHERE CAST("timestamp" AS DATE) = CAST(:trade_date AS DATE)',
+        f'SELECT * FROM "{symbol}" WHERE CAST("timestamp" AS DATE) = CAST(:trade_date AS DATE)',
         {"trade_date": trade_date},
     ))
 
@@ -18386,9 +18386,9 @@ def _v11837_read_expiry_frame(symbol, expiry):
     variants = [str(v).strip() for v in expiry_variants(expiry) if str(v).strip()]
     attempts = []
     if variants:
-        stmt = sqlalchemy.text(f'SELECT * FROM public."{symbol}" WHERE "expiryDate" = ANY(:expiries)')
+        stmt = sqlalchemy.text(f'SELECT * FROM "{symbol}" WHERE "expiryDate" = ANY(:expiries)')
         attempts.append((stmt, {"expiries": variants}))
-    attempts.append((sqlalchemy.text(f'SELECT * FROM public."{symbol}"'), {}))
+    attempts.append((sqlalchemy.text(f'SELECT * FROM "{symbol}"'), {}))
 
     for stmt, params in attempts:
         try:
