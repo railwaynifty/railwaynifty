@@ -1,1343 +1,843 @@
 # -*- coding: utf-8 -*-
 """
-Index live-data fetcher - RAW ONLY version - quote-derivative 404 safe
+NSE360 Upstox Analytics live worker.
 
-Purpose:
-- Fetch NSE derivative quote data for NIFTY and BANKNIFTY only.
-- Store raw current-expiry futures rows into: idxfuturesdata_current
-- Store raw options rows into: idxoptionsdata_current
-  - NIFTY: current expiry + next expiry
-  - BANKNIFTY: current expiry only
+Purpose
+-------
+Replace direct NSE website scraping (which is commonly blocked from cloud IPs)
+with the read-only Upstox Analytics APIs while preserving the existing
+PostgreSQL table names/column names consumed by the NSE360 backend/frontend.
 
-Removed:
-- Short Covering logic
-- daily_coi_summary table creation/update
-- alert_logs table creation/update
-- minute_bucket / alert dedupe logic
+Writes
+------
+options."NIFTY"     Current-week + next-week option-chain snapshots.
+futures."NIFTY"     Nearest NIFTY futures snapshot.
+cash.*               NIFTY 50 cash-basket proxy tables used by 360 Money Flow.
 
-Notes:
-- This version does NOT require openInterest to be present for filtering.
-- If openInterest exists, it is retained in the data.
-- If openInterest is missing from the NSE response, the script prints a warning and continues without crashing.
+Required environment variables
+------------------------------
+DATABASE_URL
+UPSTOX_ANALYTICS_TOKEN
+
+Optional environment variables
+------------------------------
+UPSTOX_UNDERLYING_KEY=NSE_INDEX|Nifty 50
+UPSTOX_OPTION_EXPIRIES=current_week,next_week
+UPSTOX_WAIT_SECONDS=60
+UPSTOX_REQUEST_TIMEOUT=30
+UPSTOX_RUN_OUTSIDE_MARKET=0
+UPSTOX_DISABLE_CASH_MONEY_FLOW=0
+NIFTY50_CONSTITUENTS_URL=https://niftyindices.com/IndexConstituent/ind_nifty50list.csv
+APP_DATA_DIR=/app/data
+SCHEMA_OPTIONS=options
+SCHEMA_FUTURES=futures
+SCHEMA_CASH=cash
 """
+from __future__ import annotations
 
-import os
-import json
-import time
-import random
+import argparse
 import importlib.util
-from datetime import datetime, date, timedelta, time as dtime
+import json
+import math
+import os
+import sys
+import time
+from datetime import date, datetime, time as dtime
 from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
-from urllib.parse import quote
 
-import requests
 import pandas as pd
+import requests
 import sqlalchemy
-import autocookie
+from sqlalchemy import inspect, text
+
 from cloud_db import make_schema_engine
+import cash_money_flow as cash
+
 
 # -------------------- CONFIG --------------------
-PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
-BASE_DIR = os.getenv('APP_DATA_DIR', str(Path(__file__).resolve().parent / 'data'))
-os.makedirs(BASE_DIR, exist_ok=True)
-os.chdir(BASE_DIR)
+IST = ZoneInfo("Asia/Kolkata")
+PROJECT_DIR = Path(__file__).resolve().parent
+APP_DATA_DIR = Path(os.getenv("APP_DATA_DIR", str(PROJECT_DIR / "data")))
+APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-COOKIES_PATH = os.path.join(BASE_DIR, 'cookies.txt')
-DBINFO_PATH  = os.path.join(BASE_DIR, 'dbinfo.txt')
-INDICES_PATH = os.path.join(BASE_DIR, 'indices1.txt')
-
-# Cloud build is intentionally NIFTY-only.
-ALLOWED_SYMBOLS = {'NIFTY'}
-IST = ZoneInfo('Asia/Kolkata')
+TOKEN = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
+UNDERLYING_KEY = os.getenv("UPSTOX_UNDERLYING_KEY", "NSE_INDEX|Nifty 50").strip()
+OPTION_EXPIRIES = tuple(
+    value.strip()
+    for value in os.getenv("UPSTOX_OPTION_EXPIRIES", "current_week,next_week").split(",")
+    if value.strip()
+)
+WAIT_SECONDS = max(15, int(os.getenv("UPSTOX_WAIT_SECONDS", "60")))
+REQUEST_TIMEOUT = max(5, int(os.getenv("UPSTOX_REQUEST_TIMEOUT", "30")))
 MARKET_START = dtime(9, 14)
 MARKET_END = dtime(15, 50)
-NSE_COOKIE_HEADER = os.getenv('NSE_COOKIE_HEADER', '').strip()
-
-WAIT_SECONDS = 60  # 1 minute between cycles
-
-# Dynamic safety fallback for option-chain-v3 when quote-derivative
-# returns expiry metadata in an unexpected shape.
-#
-# Prefer NSE metadata whenever possible. This fallback is used only when NSE
-# expiry metadata cannot be parsed.
-# Python weekday: Monday=0, Tuesday=1, ..., Sunday=6.
-OPTION_WEEKLY_FALLBACK_WEEKDAY = {
-    'NIFTY': 1,
+RUN_OUTSIDE_MARKET = os.getenv("UPSTOX_RUN_OUTSIDE_MARKET", "0").strip().lower() in {
+    "1", "true", "yes", "y"
 }
-
-OPTION_MONTHLY_FALLBACK_WEEKDAY = {
-    'BANKNIFTY': 1,
+ENABLE_CASH = os.getenv("UPSTOX_DISABLE_CASH_MONEY_FLOW", "0").strip().lower() not in {
+    "1", "true", "yes", "y"
 }
+CONSTITUENTS_URL = os.getenv(
+    "NIFTY50_CONSTITUENTS_URL",
+    "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv",
+).strip()
+FALLBACK_CONSTITUENTS = PROJECT_DIR / "nifty50_constituents_fallback.csv"
 
-FUTURES_INDEX_PARAM = {
-    'NIFTY': 'nse50_fut',
-    'BANKNIFTY': 'nifty_bank_fut',
-}
+API_BASE = "https://api.upstox.com"
+SYMBOL = "NIFTY"
 
-OPTION_INDEX_PARAM = {
-    'NIFTY': 'nse50_opt',
-    'BANKNIFTY': 'nifty_bank_opt',
-}
+SESSION = requests.Session()
+SESSION.headers.update(
+    {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "User-Agent": "NSE360-Upstox-Worker/1.0",
+    }
+)
 
-LIVE_DERIVATIVE_EXTRA_COLUMN_TYPES = {
-    # Keep this empty by default.
-    # The existing raw tables already contain volume/noOfTrades/premiumTurnover/identifier.
-    # We should not auto-add duplicate/new schema fields for liveEquity data.
-}
-# ------------------------------------------------
-
-headers = {
-    'user-agent': ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                   'AppleWebKit/537.36 (KHTML, like Gecko) '
-                   'Chrome/124.0.0.0 Safari/537.36'),
-    'accept': 'application/json,text/plain,*/*',
-    'accept-encoding': 'gzip, deflate, br',
-    'accept-language': 'en-US,en;q=0.9,hi;q=0.8',
-    'referer': 'https://www.nseindia.com/get-quotes/derivatives'
-}
-
-# ---- DB engines (one Railway database, separate schemas) ----
-engine1 = make_schema_engine('idxfuturesdata_current')
-engine2 = make_schema_engine('idxoptionsdata_current')
-
+_OPTION_ENGINE: Optional[sqlalchemy.Engine] = None
+_FUTURE_ENGINE: Optional[sqlalchemy.Engine] = None
+_CASH_ENGINE: Optional[sqlalchemy.Engine] = None
 _OPTION_BUYING_AI_MODULE = None
-_CASH_MONEY_FLOW_MODULE = None
-_CASH_MONEY_FLOW_ENGINE = None
-_CASH_MONEY_FLOW_READY = False
-ENABLE_CASH_MONEY_FLOW = os.environ.get('NSE360_DISABLE_CASH_MONEY_FLOW', '0').strip().lower() not in {'1', 'true', 'yes', 'y'}
-CASH_MONEY_FLOW_SCRIPT = os.path.join(PROJECT_DIR, 'cash_money_flow.py')
+_FUTURE_CONTRACT_CACHE: Dict[str, Any] = {}
+_CONSTITUENT_CACHE: Dict[str, Any] = {}
 
 
-def refresh_option_buying_ai_cache(symbol, trade_date=None, expiry=None):
-    """
-    Refresh dashboard-readable option-buying DB rows + JSON cache.
+# -------------------- GENERAL HELPERS --------------------
+def now_ist() -> datetime:
+    return datetime.now(IST)
 
-    This is intentionally best-effort: raw data collection must continue even if
-    the signal layer has an import/query issue.
-    """
-    global _OPTION_BUYING_AI_MODULE
+
+def snapshot_timestamp(value: Optional[datetime] = None) -> str:
+    return (value or now_ist()).strftime("%d-%b-%Y %H:%M:%S")
+
+
+def safe_number(value: Any) -> Optional[float]:
+    if value is None or isinstance(value, bool):
+        return None
     try:
-        dashboard_path = os.path.join(
-            PROJECT_DIR,
-            'dashboard.py',
+        if isinstance(value, str):
+            value = value.replace(",", "").strip()
+            if value.lower() in {"", "-", "--", "none", "null", "nan", "xx"}:
+                return None
+        number = float(value)
+        if math.isnan(number) or math.isinf(number):
+            return None
+        return number
+    except Exception:
+        return None
+
+
+def pct_change(current: Any, previous: Any) -> Optional[float]:
+    current_n = safe_number(current)
+    previous_n = safe_number(previous)
+    if current_n is None or previous_n in (None, 0):
+        return None
+    return ((current_n - previous_n) / abs(previous_n)) * 100.0
+
+
+def json_dumps(value: Any) -> str:
+    return json.dumps(value, default=str, ensure_ascii=False)
+
+
+def market_is_open(moment: Optional[datetime] = None) -> bool:
+    moment = moment or now_ist()
+    return moment.weekday() < 5 and MARKET_START <= moment.time() <= MARKET_END
+
+
+def seconds_to_next_cycle(period: int = WAIT_SECONDS) -> float:
+    return max(1.0, period - (time.time() % period))
+
+
+def require_token() -> None:
+    if not TOKEN:
+        raise RuntimeError(
+            "UPSTOX_ANALYTICS_TOKEN is missing. Add it to Railway > "
+            "nse360-live-worker > Variables and redeploy."
         )
+    if len(TOKEN) < 20:
+        raise RuntimeError("UPSTOX_ANALYTICS_TOKEN looks incomplete; copy the full token.")
+
+
+# -------------------- UPSTOX API --------------------
+def upstox_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    require_token()
+    url = f"{API_BASE}{path}"
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    response = SESSION.get(url, params=params or {}, headers=headers, timeout=REQUEST_TIMEOUT)
+    if response.status_code in {401, 403}:
+        body = response.text[:500]
+        raise RuntimeError(
+            f"Upstox authentication failed with HTTP {response.status_code}. "
+            f"Confirm the full Analytics Token is saved in Railway. Response: {body}"
+        )
+    try:
+        response.raise_for_status()
+    except requests.HTTPError as exc:
+        raise RuntimeError(
+            f"Upstox HTTP {response.status_code} for {path}: {response.text[:700]}"
+        ) from exc
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError(f"Upstox returned non-JSON for {path}: {response.text[:500]}") from exc
+    if str(payload.get("status", "success")).lower() not in {"success", "ok"}:
+        raise RuntimeError(f"Upstox API error for {path}: {payload}")
+    return payload
+
+
+def fetch_option_chain(expiry_selector: str) -> List[Dict[str, Any]]:
+    payload = upstox_get(
+        "/v2/option/chain",
+        {"instrument_key": UNDERLYING_KEY, "expiry_date": expiry_selector},
+    )
+    rows = payload.get("data") or []
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Unexpected option-chain response for {expiry_selector}: {type(rows).__name__}")
+    return rows
+
+
+def search_nearest_future_contract(force: bool = False) -> Dict[str, Any]:
+    today = now_ist().date()
+    cached = _FUTURE_CONTRACT_CACHE.get("contract")
+    cached_date = _FUTURE_CONTRACT_CACHE.get("date")
+    if cached and cached_date == today.isoformat() and not force:
+        return dict(cached)
+
+    attempts = [
+        {"segments": "FUT", "expiry": "current_month"},
+        {"segments": "FO", "expiry": "current_month"},
+    ]
+    candidates: List[Dict[str, Any]] = []
+    for attempt in attempts:
+        payload = upstox_get(
+            "/v2/instruments/search",
+            {
+                "query": "NIFTY",
+                "exchanges": "NSE",
+                "segments": attempt["segments"],
+                "instrument_types": "FUT",
+                "expiry": attempt["expiry"],
+                "page_number": 1,
+                "records": 30,
+            },
+        )
+        data = payload.get("data") or []
+        if isinstance(data, list):
+            candidates.extend(data)
+        if candidates:
+            break
+
+    normalized: List[Tuple[date, Dict[str, Any]]] = []
+    for item in candidates:
+        if str(item.get("instrument_type") or "").upper() != "FUT":
+            continue
+        underlying = str(item.get("underlying_symbol") or item.get("trading_symbol") or "").upper()
+        if "NIFTY" not in underlying or "BANK" in underlying or "MID" in underlying or "FIN" in underlying:
+            continue
+        expiry_raw = item.get("expiry")
+        try:
+            expiry_dt = pd.to_datetime(expiry_raw, errors="raise").date()
+        except Exception:
+            continue
+        if expiry_dt >= today:
+            normalized.append((expiry_dt, item))
+
+    if not normalized:
+        raise RuntimeError("Upstox instrument search returned no active NIFTY futures contract.")
+    normalized.sort(key=lambda pair: pair[0])
+    contract = dict(normalized[0][1])
+    _FUTURE_CONTRACT_CACHE.update({"date": today.isoformat(), "contract": contract})
+    return contract
+
+
+def fetch_full_quotes(instrument_keys: Sequence[str]) -> Dict[str, Dict[str, Any]]:
+    keys = [str(key).strip() for key in instrument_keys if str(key).strip()]
+    if not keys:
+        return {}
+    if len(keys) > 500:
+        raise ValueError("Upstox full-quote request supports at most 500 instrument keys.")
+    payload = upstox_get(
+        "/v2/market-quote/quotes",
+        {"instrument_key": ",".join(keys)},
+    )
+    data = payload.get("data") or {}
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected full-quote response: {type(data).__name__}")
+
+    by_key: Dict[str, Dict[str, Any]] = {}
+    for response_key, quote in data.items():
+        if not isinstance(quote, dict):
+            continue
+        token = str(quote.get("instrument_token") or quote.get("instrument_key") or "").strip()
+        if token:
+            by_key[token] = quote
+        # Upstox response object keys often use SEGMENT:SYMBOL rather than the instrument key.
+        by_key[str(response_key)] = quote
+    return by_key
+
+
+def find_quote(quotes: Dict[str, Dict[str, Any]], instrument_key: str) -> Dict[str, Any]:
+    if instrument_key in quotes:
+        return quotes[instrument_key]
+    segment, _, token = instrument_key.partition("|")
+    candidates = {
+        f"{segment}:{token}",
+        f"{segment}:{token.upper()}",
+        f"{segment}|{token}",
+    }
+    for key in candidates:
+        if key in quotes:
+            return quotes[key]
+    for quote in quotes.values():
+        if str(quote.get("instrument_token") or "") == instrument_key:
+            return quote
+    return {}
+
+
+# -------------------- DATAFRAME MAPPING --------------------
+def build_options_dataframe(chains: Iterable[List[Dict[str, Any]]], ts: str) -> pd.DataFrame:
+    rows: List[Dict[str, Any]] = []
+    seen: set[Tuple[str, float, str]] = set()
+    for chain in chains:
+        for strike_item in chain:
+            if not isinstance(strike_item, dict):
+                continue
+            expiry = str(strike_item.get("expiry") or "").strip()
+            strike = safe_number(strike_item.get("strike_price"))
+            spot = safe_number(strike_item.get("underlying_spot_price"))
+            pcr = safe_number(strike_item.get("pcr"))
+            if not expiry or strike is None:
+                continue
+            for side_key, side in (("call_options", "CE"), ("put_options", "PE")):
+                option = strike_item.get(side_key) or {}
+                if not isinstance(option, dict):
+                    continue
+                market = option.get("market_data") or {}
+                greeks = option.get("option_greeks") or {}
+                if not isinstance(market, dict):
+                    market = {}
+                if not isinstance(greeks, dict):
+                    greeks = {}
+                key = (expiry, float(strike), side)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                oi = safe_number(market.get("oi"))
+                prev_oi = safe_number(market.get("prev_oi"))
+                coi = (oi - prev_oi) if oi is not None and prev_oi is not None else None
+                ltp = safe_number(market.get("ltp"))
+                close_price = safe_number(market.get("close_price"))
+                price_change = (ltp - close_price) if ltp is not None and close_price is not None else None
+                volume = safe_number(market.get("volume"))
+                instrument_key = str(option.get("instrument_key") or "").strip()
+
+                rows.append(
+                    {
+                        "symbol": SYMBOL,
+                        "identifier": instrument_key,
+                        "instrumentKey": instrument_key,
+                        "instrumentType": "Index Options",
+                        "expiryDate": expiry,
+                        "optionType": side,
+                        "strikePrice": strike,
+                        "lastPrice": ltp,
+                        "closePrice": close_price,
+                        "change": price_change,
+                        "pChange": pct_change(ltp, close_price),
+                        "tradedVolume": volume,
+                        "tradedContracts": volume,
+                        "volume": volume,
+                        "openInterest": oi,
+                        "prevOpenInterest": prev_oi,
+                        "changeinOI": coi,
+                        "pchangeinOI": pct_change(oi, prev_oi),
+                        "impliedVolatility": safe_number(greeks.get("iv")),
+                        "delta": safe_number(greeks.get("delta")),
+                        "gamma": safe_number(greeks.get("gamma")),
+                        "theta": safe_number(greeks.get("theta")),
+                        "vega": safe_number(greeks.get("vega")),
+                        "pop": safe_number(greeks.get("pop")),
+                        "bidPrice": safe_number(market.get("bid_price")),
+                        "bidQty": safe_number(market.get("bid_qty")),
+                        "askPrice": safe_number(market.get("ask_price")),
+                        "askQty": safe_number(market.get("ask_qty")),
+                        "spotPrice": spot,
+                        "underlyingValue": spot,
+                        "pcr": pcr,
+                        "dataSource": "UPSTOX_ANALYTICS",
+                        "timestamp": ts,
+                    }
+                )
+    return pd.DataFrame(rows)
+
+
+def latest_and_first_future_oi(engine: sqlalchemy.Engine, trade_date: str) -> Tuple[Optional[float], Optional[float]]:
+    if not table_exists(engine, SYMBOL):
+        return None, None
+    prefix = datetime.strptime(trade_date, "%Y-%m-%d").strftime("%d-%b-%Y") + "%"
+    try:
+        with engine.connect() as conn:
+            first = conn.execute(
+                text(
+                    f'SELECT "openInterest" FROM "{SYMBOL}" '
+                    'WHERE "timestamp" LIKE :prefix ORDER BY CAST("timestamp" AS TIMESTAMP) ASC LIMIT 1'
+                ),
+                {"prefix": prefix},
+            ).scalar()
+            latest = conn.execute(
+                text(
+                    f'SELECT "openInterest" FROM "{SYMBOL}" '
+                    'WHERE "timestamp" LIKE :prefix ORDER BY CAST("timestamp" AS TIMESTAMP) DESC LIMIT 1'
+                ),
+                {"prefix": prefix},
+            ).scalar()
+        return safe_number(first), safe_number(latest)
+    except Exception:
+        return None, None
+
+
+def build_futures_dataframe(
+    contract: Dict[str, Any],
+    future_quote: Dict[str, Any],
+    spot_quote: Dict[str, Any],
+    ts: str,
+    engine: sqlalchemy.Engine,
+) -> pd.DataFrame:
+    if not future_quote:
+        return pd.DataFrame()
+    trade_date = now_ist().date().isoformat()
+    first_oi, previous_oi = latest_and_first_future_oi(engine, trade_date)
+    oi = safe_number(future_quote.get("oi"))
+    intraday_coi = (oi - first_oi) if oi is not None and first_oi is not None else 0.0
+    one_minute_coi = (oi - previous_oi) if oi is not None and previous_oi is not None else 0.0
+    ohlc = future_quote.get("ohlc") or {}
+    spot = safe_number(spot_quote.get("last_price"))
+    if spot is None:
+        spot = safe_number(future_quote.get("underlying_spot_price"))
+    expiry = str(contract.get("expiry") or "").strip()
+    last_price = safe_number(future_quote.get("last_price"))
+    close_price = safe_number(ohlc.get("close"))
+    volume = safe_number(future_quote.get("volume"))
+    row = {
+        "symbol": SYMBOL,
+        "identifier": str(contract.get("instrument_key") or ""),
+        "instrumentKey": str(contract.get("instrument_key") or ""),
+        "instrumentType": "Index Futures",
+        "expiryDate": expiry,
+        "lastPrice": last_price,
+        "openPrice": safe_number(ohlc.get("open")),
+        "highPrice": safe_number(ohlc.get("high")),
+        "lowPrice": safe_number(ohlc.get("low")),
+        "closePrice": close_price,
+        "change": safe_number(future_quote.get("net_change")),
+        "pChange": pct_change(last_price, close_price),
+        "vwap": safe_number(future_quote.get("average_price")),
+        "tradedVolume": volume,
+        "tradedContracts": volume,
+        "volume": volume,
+        "openInterest": oi,
+        "changeinOI": intraday_coi,
+        "pchangeinOI": pct_change(oi, first_oi),
+        "oneMinuteChangeinOI": one_minute_coi,
+        "oiDayHigh": safe_number(future_quote.get("oi_day_high")),
+        "oiDayLow": safe_number(future_quote.get("oi_day_low")),
+        "spotPrice": spot,
+        "underlyingValue": spot,
+        "dataSource": "UPSTOX_ANALYTICS",
+        "timestamp": ts,
+    }
+    return pd.DataFrame([row])
+
+
+# -------------------- DATABASE HELPERS --------------------
+def option_engine() -> sqlalchemy.Engine:
+    global _OPTION_ENGINE
+    if _OPTION_ENGINE is None:
+        _OPTION_ENGINE = make_schema_engine("idxoptionsdata_current")
+    return _OPTION_ENGINE
+
+
+def future_engine() -> sqlalchemy.Engine:
+    global _FUTURE_ENGINE
+    if _FUTURE_ENGINE is None:
+        _FUTURE_ENGINE = make_schema_engine("idxfuturesdata_current")
+    return _FUTURE_ENGINE
+
+
+def cash_engine() -> sqlalchemy.Engine:
+    global _CASH_ENGINE
+    if _CASH_ENGINE is None:
+        cash.ensure_database(cash.DEFAULT_DATABASE, cash.DBINFO_PATH)
+        _CASH_ENGINE = cash.make_engine(cash.DEFAULT_DATABASE, cash.DBINFO_PATH)
+        cash.create_tables(_CASH_ENGINE)
+    return _CASH_ENGINE
+
+
+def table_exists(engine: sqlalchemy.Engine, table_name: str) -> bool:
+    try:
+        return inspect(engine).has_table(table_name)
+    except Exception:
+        return False
+
+
+def align_frame_to_existing_table(
+    conn: sqlalchemy.Connection,
+    frame: pd.DataFrame,
+    table_name: str,
+) -> pd.DataFrame:
+    if frame.empty:
+        return frame
+    inspector = inspect(conn)
+    if not inspector.has_table(table_name):
+        return frame
+    existing = [column["name"] for column in inspector.get_columns(table_name)]
+    out = frame.copy()
+    for column in existing:
+        if column not in out.columns:
+            out[column] = None
+    # Preserve the existing table contract. New adapter-only fields are omitted if an old table exists.
+    return out[existing]
+
+
+def replace_option_snapshot(engine: sqlalchemy.Engine, frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    ts_values = sorted({str(value) for value in frame["timestamp"].dropna().tolist()})
+    expiry_values = sorted({str(value) for value in frame["expiryDate"].dropna().tolist()})
+    with engine.begin() as conn:
+        inspector = inspect(conn)
+        if inspector.has_table(SYMBOL):
+            stmt = text(
+                f'DELETE FROM "{SYMBOL}" WHERE "timestamp" = :ts AND "expiryDate" = :expiry'
+            )
+            for ts_value in ts_values:
+                for expiry_value in expiry_values:
+                    conn.execute(stmt, {"ts": ts_value, "expiry": expiry_value})
+        ready = align_frame_to_existing_table(conn, frame, SYMBOL)
+        ready.to_sql(SYMBOL, con=conn, if_exists="append", index=False, method="multi", chunksize=1000)
+    return len(frame)
+
+
+def replace_future_snapshot(engine: sqlalchemy.Engine, frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    ts_value = str(frame.iloc[0]["timestamp"])
+    with engine.begin() as conn:
+        if inspect(conn).has_table(SYMBOL):
+            conn.execute(text(f'DELETE FROM "{SYMBOL}" WHERE "timestamp" = :ts'), {"ts": ts_value})
+        ready = align_frame_to_existing_table(conn, frame, SYMBOL)
+        ready.to_sql(SYMBOL, con=conn, if_exists="append", index=False, method="multi")
+    return len(frame)
+
+
+# -------------------- CASH MONEY FLOW --------------------
+def load_nifty50_constituents(force: bool = False) -> pd.DataFrame:
+    today_key = now_ist().date().isoformat()
+    cached = _CONSTITUENT_CACHE.get("frame")
+    if cached is not None and _CONSTITUENT_CACHE.get("date") == today_key and not force:
+        return cached.copy()
+
+    frame = pd.DataFrame()
+    if CONSTITUENTS_URL:
+        try:
+            response = SESSION.get(
+                CONSTITUENTS_URL,
+                headers={"User-Agent": "Mozilla/5.0 NSE360/1.0"},
+                timeout=REQUEST_TIMEOUT,
+            )
+            response.raise_for_status()
+            from io import StringIO
+
+            frame = pd.read_csv(StringIO(response.text))
+            print(f"[CASH] Downloaded {len(frame)} NIFTY 50 constituents from Nifty Indices.")
+        except Exception as exc:
+            print(f"[CASH] Constituent download failed: {type(exc).__name__}: {exc}")
+
+    if frame.empty and FALLBACK_CONSTITUENTS.exists():
+        frame = pd.read_csv(FALLBACK_CONSTITUENTS)
+        print(f"[CASH] Using bundled constituent fallback with {len(frame)} rows.")
+
+    required = {"Company Name", "Industry", "Symbol", "ISIN Code"}
+    if frame.empty or not required.issubset(set(frame.columns)):
+        raise RuntimeError(
+            "NIFTY 50 constituent list unavailable or has unexpected columns. "
+            f"Required: {sorted(required)}"
+        )
+    frame = frame.dropna(subset=["Symbol", "ISIN Code"]).copy()
+    frame["Symbol"] = frame["Symbol"].astype(str).str.strip().str.upper()
+    frame["ISIN Code"] = frame["ISIN Code"].astype(str).str.strip()
+    frame["instrument_key"] = "NSE_EQ|" + frame["ISIN Code"]
+    frame = frame.drop_duplicates(subset=["instrument_key"]).reset_index(drop=True)
+    _CONSTITUENT_CACHE.update({"date": today_key, "frame": frame.copy()})
+    return frame
+
+
+def build_cash_rows(
+    constituents: pd.DataFrame,
+    quotes: Dict[str, Dict[str, Any]],
+    ts: str,
+    trade_date: str,
+    engine: sqlalchemy.Engine,
+) -> List[Dict[str, Any]]:
+    previous = cash.get_previous_snapshot_map(engine, cash.DEFAULT_INDEX_NAME, trade_date, ts)
+    count = max(1, len(constituents))
+    equal_weight = 100.0 / count
+    rows: List[Dict[str, Any]] = []
+
+    for _, constituent in constituents.iterrows():
+        instrument_key = str(constituent["instrument_key"])
+        symbol = str(constituent["Symbol"])
+        quote = find_quote(quotes, instrument_key)
+        if not quote:
+            continue
+        previous_row = previous.get(symbol) or {}
+        ohlc = quote.get("ohlc") or {}
+        open_price = safe_number(ohlc.get("open"))
+        high_price = safe_number(ohlc.get("high"))
+        low_price = safe_number(ohlc.get("low"))
+        last_price = safe_number(quote.get("last_price"))
+        previous_close = safe_number(ohlc.get("close"))
+        day_volume = safe_number(quote.get("volume"))
+        previous_day_volume = safe_number(previous_row.get("day_volume"))
+        previous_snapshot_price = safe_number(previous_row.get("last_price"))
+        previous_average_price = safe_number(previous_row.get("typical_price"))
+        previous_multiplier = safe_number(previous_row.get("money_flow_multiplier"))
+        previous_signed_flow = safe_number(previous_row.get("signed_flow"))
+
+        minute_volume = (
+            0.0
+            if day_volume is None or previous_day_volume is None
+            else max(0.0, day_volume - previous_day_volume)
+        )
+        average_price = cash.cash_average_price(high_price, low_price, open_price, last_price)
+        multiplier = cash.money_flow_multiplier(
+            average_price,
+            previous_average_price,
+            open_price,
+            last_price,
+            previous_multiplier,
+            previous_signed_flow,
+        )
+        gross_flow = minute_volume * average_price if average_price is not None else 0.0
+        signed_flow = gross_flow * multiplier
+        gross_flow_cr = gross_flow / 10_000_000.0
+        signed_flow_cr = signed_flow / 10_000_000.0
+        price_change = (
+            last_price - previous_snapshot_price
+            if last_price is not None and previous_snapshot_price is not None
+            else (
+                last_price - previous_close
+                if last_price is not None and previous_close is not None
+                else None
+            )
+        )
+        weighted_signed_flow_cr = signed_flow_cr * (equal_weight / 100.0)
+        rows.append(
+            {
+                "index_symbol": cash.DEFAULT_INDEX_NAME,
+                "trade_date": trade_date,
+                "timestamp": ts,
+                "symbol": symbol,
+                "company_name": str(constituent.get("Company Name") or ""),
+                "industry": str(constituent.get("Industry") or ""),
+                "series": str(constituent.get("Series") or "EQ"),
+                "open_price": open_price,
+                "high_price": high_price,
+                "low_price": low_price,
+                "last_price": last_price,
+                "previous_close": previous_close,
+                "previous_snapshot_price": previous_snapshot_price,
+                "price_change": price_change,
+                "price_change_pct": pct_change(last_price, previous_snapshot_price or previous_close),
+                "day_volume": day_volume,
+                "previous_day_volume": previous_day_volume,
+                "minute_volume": minute_volume,
+                "day_value_raw": (
+                    day_volume * safe_number(quote.get("average_price"))
+                    if day_volume is not None and safe_number(quote.get("average_price")) is not None
+                    else None
+                ),
+                "typical_price": average_price,
+                "money_flow_multiplier": multiplier,
+                "gross_flow": gross_flow,
+                "signed_flow": signed_flow,
+                "gross_flow_cr": gross_flow_cr,
+                "signed_flow_cr": signed_flow_cr,
+                "flow_direction": "Inflow" if signed_flow_cr > 0 else ("Outflow" if signed_flow_cr < 0 else "Neutral"),
+                "free_float_mcap": None,
+                "index_weight_pct": equal_weight,
+                "weighted_signed_flow_cr": weighted_signed_flow_cr,
+                "raw_json": json_dumps({"instrument_key": instrument_key, "quote": quote}),
+                "index_weight_source": "equal_upstox",
+            }
+        )
+    return rows
+
+
+def run_cash_cycle(ts: str, trade_date: str) -> Optional[Dict[str, Any]]:
+    if not ENABLE_CASH:
+        return None
+    engine = cash_engine()
+    constituents = load_nifty50_constituents()
+    quotes = fetch_full_quotes(constituents["instrument_key"].tolist())
+    rows = build_cash_rows(constituents, quotes, ts, trade_date, engine)
+    if not rows:
+        raise RuntimeError("Upstox returned no usable NIFTY 50 constituent quotes.")
+    summary = cash.build_summary(cash.DEFAULT_INDEX_NAME, trade_date, ts, rows)
+    with engine.begin() as conn:
+        cash.upsert_constituents(conn, rows, trade_date, ts, cash.DEFAULT_INDEX_NAME)
+        stored = cash.upsert_flow_rows(conn, rows)
+        cash.upsert_summary(conn, summary)
+    print(
+        f"[CASH] stored={stored} direction={summary['cash_direction']} "
+        f"score={summary['final_cash_score']:.2f} net={summary['net_flow_cr']:.4f} Cr"
+    )
+    return summary
+
+
+# -------------------- OPTIONAL SIGNAL CACHE --------------------
+def refresh_option_buying_ai_cache(trade_date: str, expiry: Optional[str]) -> None:
+    global _OPTION_BUYING_AI_MODULE
+    if os.getenv("UPSTOX_DISABLE_OPTION_AI_CACHE", "0").strip().lower() in {"1", "true", "yes"}:
+        return
+    try:
+        dashboard_path = PROJECT_DIR / "dashboard.py"
         if _OPTION_BUYING_AI_MODULE is None:
-            spec = importlib.util.spec_from_file_location('nse_360_dashboard_option_ai', dashboard_path)
+            spec = importlib.util.spec_from_file_location("nse360_dashboard_option_ai", dashboard_path)
             if spec is None or spec.loader is None:
-                raise RuntimeError(f'Could not load dashboard module from {dashboard_path}')
+                raise RuntimeError(f"Could not load {dashboard_path}")
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             _OPTION_BUYING_AI_MODULE = module
-
         payload = _OPTION_BUYING_AI_MODULE.build_option_buying_ai_payload(
-            symbol,
+            SYMBOL,
             trade_date=trade_date,
             expiry=expiry,
             band=20,
         )
-        result = payload.get('optionBuyingResultWrite') or {}
-        if payload.get('error'):
-            print(f"[WARN] Option Buying AI cache skipped for {symbol}: {payload.get('error')}")
+        if payload.get("error"):
+            print(f"[AI] Cache skipped: {payload.get('error')}")
         else:
+            result = payload.get("optionBuyingResultWrite") or {}
             print(
-                f"[INFO] Option Buying AI cache refreshed for {symbol}: "
-                f"{result.get('storedCandidates', 0)} rows, JSON cached={result.get('payloadCached')}"
+                f"[AI] cache rows={result.get('storedCandidates', 0)} "
+                f"payloadCached={result.get('payloadCached')}"
             )
     except Exception as exc:
-        print(f"[WARN] Option Buying AI cache refresh failed for {symbol}: {type(exc).__name__}: {exc}")
-
-
-def _load_cash_money_flow_module():
-    """Load the NIFTY 50 cash money-flow collector so this script can run one combined cycle."""
-    global _CASH_MONEY_FLOW_MODULE
-    if _CASH_MONEY_FLOW_MODULE is not None:
-        return _CASH_MONEY_FLOW_MODULE
-    if not os.path.exists(CASH_MONEY_FLOW_SCRIPT):
-        raise FileNotFoundError(CASH_MONEY_FLOW_SCRIPT)
-
-    spec = importlib.util.spec_from_file_location('nse_360_cash_money_flow', CASH_MONEY_FLOW_SCRIPT)
-    if spec is None or spec.loader is None:
-        raise RuntimeError(f'Could not load cash money-flow module from {CASH_MONEY_FLOW_SCRIPT}')
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    _CASH_MONEY_FLOW_MODULE = module
-    return module
-
-
-def run_cash_money_flow_cycle():
-    """Run one cash money-flow upsert cycle after options/futures have been collected."""
-    if not ENABLE_CASH_MONEY_FLOW:
-        return None
-
-    global _CASH_MONEY_FLOW_ENGINE, _CASH_MONEY_FLOW_READY
-    try:
-        module = _load_cash_money_flow_module()
-        index_name = getattr(module, 'DEFAULT_INDEX_NAME', 'NIFTY 50')
-        database = getattr(module, 'DEFAULT_DATABASE', 'idxcashdata_current')
-        dbinfo_path = getattr(module, 'DBINFO_PATH', DBINFO_PATH)
-
-        if not _CASH_MONEY_FLOW_READY:
-            module.ensure_database(database, dbinfo_path)
-            _CASH_MONEY_FLOW_ENGINE = module.make_engine(database, dbinfo_path)
-            module.create_tables(_CASH_MONEY_FLOW_ENGINE)
-            module.bootstrap_cookies(index_name, force_refresh=False)
-            _CASH_MONEY_FLOW_READY = True
-            print(f"[READY] Integrated cash money-flow ready in database {database}.")
-
-        return module.run_cycle(_CASH_MONEY_FLOW_ENGINE, index_name, force_upsert=True)
-    except Exception as exc:
-        print(f"[WARN] Integrated cash money-flow cycle skipped: {type(exc).__name__}: {exc}")
-        return None
-
-
-# ---- session ----
-session = requests.session()
-
-
-def load_symbols():
-    """Cloud deployment is intentionally restricted to NIFTY."""
-    return ['NIFTY']
-
-
-symbols = load_symbols()
-print(f"Symbols enabled for raw storage: {', '.join(symbols)}")
-
-
-# ================== COOKIE HELPERS ==================
-def _cookie_dict_from_text(text):
-    """Parse JSON or a raw Cookie header into a dictionary."""
-    raw = str(text or '').strip()
-    if not raw:
-        return {}
-
-    try:
-        parsed = json.loads(raw)
-        if isinstance(parsed, dict):
-            return {str(k): str(v) for k, v in parsed.items() if str(k).strip()}
-    except Exception:
-        pass
-
-    cookie_dict = {}
-    for part in raw.split(';'):
-        if '=' not in part:
-            continue
-        key, value = part.split('=', 1)
-        key = key.strip()
-        if key:
-            cookie_dict[key] = value.strip()
-    return cookie_dict
-
-
-def _read_cookies_file():
-    """Return (cookie_header, cookie_dict); missing/empty files are allowed."""
-    if not os.path.exists(COOKIES_PATH):
-        return '', {}
-    with open(COOKIES_PATH, 'r', encoding='utf-8') as handle:
-        text = handle.read().strip()
-    cookie_dict = _cookie_dict_from_text(text)
-    header = '; '.join(f'{k}={v}' for k, v in cookie_dict.items())
-    return header, cookie_dict
-
-
-def _write_session_cookies():
-    """Persist cookies obtained by the worker's own requests.Session."""
-    cookie_dict = session.cookies.get_dict()
-    if not cookie_dict:
-        return 0
-    temp_path = COOKIES_PATH + '.tmp'
-    with open(temp_path, 'w', encoding='utf-8') as handle:
-        handle.write(';'.join(f'{k}={v}' for k, v in cookie_dict.items()))
-    os.replace(temp_path, COOKIES_PATH)
-    return len(cookie_dict)
-
-
-def _install_cookies(_cookie_header, cookie_dict):
-    """Push cookies into the shared requests session."""
-    if cookie_dict:
-        for key, value in cookie_dict.items():
-            session.cookies.set(key, value)
-    headers.pop('cookie', None)
-
-
-def _install_configured_cookies():
-    """Load optional env cookies first, then any persisted cookie file."""
-    installed = 0
-    env_cookies = _cookie_dict_from_text(NSE_COOKIE_HEADER)
-    if env_cookies:
-        _install_cookies('', env_cookies)
-        installed += len(env_cookies)
-        print(f'[COOKIES] Installed {len(env_cookies)} cookies from NSE_COOKIE_HEADER.', flush=True)
-
-    try:
-        _header, file_cookies = _read_cookies_file()
-        if file_cookies:
-            _install_cookies('', file_cookies)
-            installed += len(file_cookies)
-            print(f'[COOKIES] Installed {len(file_cookies)} cookies from cookies.txt.', flush=True)
-    except Exception as exc:
-        print(f'[COOKIES] Could not read cookies.txt: {type(exc).__name__}: {exc}', flush=True)
-    return installed
-
-
-def _prime_nse_session(symbol=None, verbose=False):
-    """Warm the shared NSE session; cookies are optional, HTTP blocks are not."""
-    warm_urls = [
-        'https://www.nseindia.com/',
-        'https://www.nseindia.com/option-chain',
-        'https://www.nseindia.com/market-data/equity-derivatives-watch',
-    ]
-    if symbol:
-        warm_urls.append(f'https://www.nseindia.com/get-quotes/derivatives?symbol={quote(symbol)}')
-
-    html_headers = headers.copy()
-    html_headers['accept'] = (
-        'text/html,application/xhtml+xml,application/xml;q=0.9,'
-        'image/avif,image/webp,*/*;q=0.8'
-    )
-    html_headers['accept-encoding'] = 'gzip, deflate'
-    html_headers['cache-control'] = 'no-cache'
-    html_headers['pragma'] = 'no-cache'
-
-    statuses = []
-    previous_url = None
-    for url in warm_urls:
-        request_headers = html_headers.copy()
-        if previous_url:
-            request_headers['referer'] = previous_url
-        response = session.get(url, headers=request_headers, timeout=25, allow_redirects=True)
-        statuses.append(response.status_code)
-        if verbose:
-            print(
-                f'[COOKIES] prime status={response.status_code} '
-                f'cookies={len(session.cookies)} bytes={len(response.content)} url={response.url}',
-                flush=True,
-            )
-        if response.status_code in {401, 403, 429}:
-            raise requests.HTTPError(
-                f'NSE session warm-up blocked with HTTP {response.status_code}',
-                response=response,
-            )
-        response.raise_for_status()
-        previous_url = response.url
-        time.sleep(0.5)
-
-    saved = _write_session_cookies()
-    if verbose:
-        print(f'[COOKIES] Session warm-up complete; saved={saved}, statuses={statuses}.', flush=True)
-    return True
-
-
-def _refresh_nse_session(reason='manual refresh'):
-    """Best-effort refresh that never crashes the persistent Railway worker."""
-    print(f'[COOKIES] Refresh requested: {reason}', flush=True)
-    try:
-        session.cookies.clear()
-    except Exception:
-        pass
-
-    _install_configured_cookies()
-
-    try:
-        refreshed = autocookie.getCookies()
-        if refreshed:
-            _install_cookies('', refreshed)
-    except Exception as exc:
-        print(f'[COOKIES] autocookie refresh failed but worker will continue: {type(exc).__name__}: {exc}', flush=True)
-
-    try:
-        return _prime_nse_session(verbose=True)
-    except Exception as exc:
-        print(f'[COOKIES] NSE session prime failed: {type(exc).__name__}: {exc}', flush=True)
-        return False
-
-
-def _bootstrap_cookies():
-    """Load available cookies and warm the session without terminating startup."""
-    _install_configured_cookies()
-    try:
-        return _prime_nse_session(verbose=True)
-    except Exception as exc:
-        print(f'[COOKIES] Initial session prime failed: {type(exc).__name__}: {exc}', flush=True)
-        return _refresh_nse_session('startup fallback')
-
-
-# ============================== UTILS ==============================
-
-def parse_expiry_date(value):
-    """Parse NSE expiry text/date into a Python date."""
-    if value is None:
-        return None
-
-    raw = str(value).strip()
-    if not raw or raw.lower() in {'none', 'nan', 'nat', 'xx', '-'}:
-        return None
-
-    candidates = [raw, raw.split()[0]]
-    for candidate in candidates:
-        for fmt in ('%d-%b-%Y', '%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y', '%Y/%m/%d'):
-            try:
-                return datetime.strptime(candidate, fmt).date()
-            except Exception:
-                pass
-
-        try:
-            parsed = pd.to_datetime(candidate, errors='coerce', dayfirst=True)
-            if pd.notna(parsed):
-                return parsed.date()
-        except Exception:
-            pass
-
-    return None
-
-
-def format_expiry_date(expiry_date):
-    """Format expiry date in NSE option-chain-v3 style, e.g. 26-May-2026."""
-    if expiry_date is None:
-        return None
-    return expiry_date.strftime('%d-%b-%Y')
-
-
-def get_next_weekly_expiries(symbol, count=1, from_date=None):
-    """Dynamic fallback expiries from today. Used only when NSE metadata fails."""
-    symbol = str(symbol).upper()
-    weekday = OPTION_WEEKLY_FALLBACK_WEEKDAY.get(symbol, 1)
-    current = from_date or date.today()
-
-    days_ahead = (weekday - current.weekday()) % 7
-    first_expiry = current + timedelta(days=days_ahead)
-
-    return [
-        format_expiry_date(first_expiry + timedelta(days=7 * i))
-        for i in range(count)
-    ]
-
-
-def get_monthly_expiries(symbol, count=1, from_date=None):
-    """Dynamic monthly fallback expiries from today. Used only when NSE metadata fails."""
-    symbol = str(symbol).upper()
-    weekday = OPTION_MONTHLY_FALLBACK_WEEKDAY.get(symbol)
-    if weekday is None:
-        return []
-
-    current = from_date or date.today()
-    month_start = date(current.year, current.month, 1)
-    expiries = []
-
-    while len(expiries) < count:
-        if month_start.month == 12:
-            next_month_start = date(month_start.year + 1, 1, 1)
-        else:
-            next_month_start = date(month_start.year, month_start.month + 1, 1)
-
-        last_day = next_month_start - timedelta(days=1)
-        days_back = (last_day.weekday() - weekday) % 7
-        expiry = last_day - timedelta(days=days_back)
-
-        if expiry >= current:
-            expiries.append(format_expiry_date(expiry))
-
-        month_start = next_month_start
-
-    return expiries
-
-
-def get_dynamic_option_expiries(symbol, count=1, from_date=None):
-    """Return symbol-specific option fallback expiries when NSE metadata fails."""
-    symbol = str(symbol).upper()
-    if symbol in OPTION_MONTHLY_FALLBACK_WEEKDAY:
-        return get_monthly_expiries(symbol, count=count, from_date=from_date)
-    return get_next_weekly_expiries(symbol, count=count, from_date=from_date)
-
-
-def get_nearest_expiries_from_list(expiry_dates, count=1):
-    """Return nearest non-expired unique expiries from a list of expiry strings."""
-    today = date.today()
-    rows = []
-
-    for expiry in expiry_dates or []:
-        parsed = parse_expiry_date(expiry)
-        if parsed is None or parsed < today:
-            continue
-        rows.append((parsed, format_expiry_date(parsed)))
-
-    rows = sorted(rows, key=lambda item: item[0])
-    expiries = []
-    for _, expiry in rows:
-        if expiry not in expiries:
-            expiries.append(expiry)
-        if len(expiries) >= count:
-            break
-
-    return expiries
-
-
-def filter_by_expiry_date(df, expiry):
-    """Filter rows by expiry date even if API returns expiry in a different text format."""
-    if df.empty or not expiry or 'expiryDate' not in df.columns:
-        return df
-
-    target = parse_expiry_date(expiry)
-    if target is None:
-        return df[df['expiryDate'].astype(str) == str(expiry)].copy()
-
-    out = df.copy()
-    out['_expiry_dt_filter'] = out['expiryDate'].map(parse_expiry_date)
-    out = out[out['_expiry_dt_filter'] == target].drop(columns=['_expiry_dt_filter']).copy()
-    return out
-
-
-
-def get_nearest_expiry(df, instrument_type):
-    """Return nearest non-expired expiry date for given instrument type."""
-    required_cols = {'instrumentType', 'expiryDate'}
-    if df.empty or not required_cols.issubset(df.columns):
-        return None
-
-    temp = df[df['instrumentType'] == instrument_type].copy()
-    if temp.empty:
-        return None
-
-    temp['expiryDate_dt'] = temp['expiryDate'].map(parse_expiry_date)
-    today = date.today()
-    future = temp[temp['expiryDate_dt'].notna() & (temp['expiryDate_dt'] >= today)].copy()
-    if future.empty:
-        return None
-
-    nearest = future.sort_values('expiryDate_dt').iloc[0]['expiryDate_dt']
-    return format_expiry_date(nearest)
-
-def get_nearest_expiries(df, instrument_type, count=1):
-    """Return nearest non-expired expiry dates for given instrument type."""
-    required_cols = {'instrumentType', 'expiryDate'}
-    if df.empty or not required_cols.issubset(df.columns):
-        return []
-
-    temp = df[df['instrumentType'] == instrument_type].copy()
-    if temp.empty:
-        return []
-
-    return get_nearest_expiries_from_list(temp['expiryDate'].astype(str).tolist(), count=count)
-
-def get_existing_timestamps(engine, symbol):
-    """Read timestamps already stored in a symbol table to avoid duplicate inserts."""
-    try:
-        with engine.connect() as conn:
-            result = pd.read_sql(f'SELECT DISTINCT "timestamp" FROM "{symbol}"', conn)
-            return set(result['timestamp'].astype(str))
-    except Exception as e:
-        print(f"[WARN] Could not read existing timestamps for {symbol}: {type(e).__name__}: {e}")
-        try:
-            engine.dispose()
-        except Exception:
-            pass
-        return set()
-
-
-
-def get_existing_timestamp_expiry_pairs(engine, symbol):
-    """Read timestamp + expiry pairs already stored to avoid duplicate expiry snapshots."""
-    try:
-        with engine.connect() as conn:
-            result = pd.read_sql(f'SELECT DISTINCT "timestamp", "expiryDate" FROM "{symbol}"', conn)
-            if result.empty or 'timestamp' not in result.columns or 'expiryDate' not in result.columns:
-                return set()
-            return set(zip(result['timestamp'].astype(str), result['expiryDate'].astype(str)))
-    except Exception as e:
-        print(f"[WARN] Could not read existing timestamp/expiry pairs for {symbol}: {type(e).__name__}: {e}")
-        try:
-            engine.dispose()
-        except Exception:
-            pass
-        return set()
-
-
-def symbol_table_exists(engine, symbol):
-    """Return True when the raw symbol table already exists."""
-    try:
-        sqlalchemy.inspect(engine).get_columns(symbol)
-        return True
-    except Exception:
-        return False
-
-
-def _execute_sql(bind, statement, params):
-    """Execute SQL on either an active Connection or an Engine."""
-    if hasattr(bind, 'execute'):
-        return bind.execute(statement, params)
-    with bind.begin() as conn:
-        return conn.execute(statement, params)
-
-
-def delete_existing_timestamp_rows(bind, symbol, timestamp_value):
-    """Replace/upsert helper: remove an old same-timestamp snapshot before appending fresh NSE rows."""
-    timestamp_text = str(timestamp_value or '').strip()
-    if not timestamp_text or not symbol_table_exists(bind, symbol):
-        return 0
-    try:
-        result = _execute_sql(
-            bind,
-            sqlalchemy.text(f'DELETE FROM "{symbol}" WHERE "timestamp" = :ts'),
-            {'ts': timestamp_text},
-        )
-        return int(result.rowcount or 0)
-    except Exception as exc:
-        print(f"[WARN] Could not replace existing rows for {symbol} @ {timestamp_text}: {type(exc).__name__}: {exc}")
-        return 0
-
-
-def delete_existing_option_snapshot_rows(bind, symbol, frame):
-    """Replace option snapshots by timestamp+expiry so current and next expiry remain independent."""
-    if frame is None or frame.empty or 'timestamp' not in frame.columns or not symbol_table_exists(bind, symbol):
-        return 0
-
-    deleted = 0
-    try:
-        if 'expiryDate' in frame.columns:
-            pairs = sorted({
-                (str(ts).strip(), str(expiry).strip())
-                for ts, expiry in zip(frame['timestamp'], frame['expiryDate'])
-                if str(ts).strip() and str(expiry).strip()
-            })
-            stmt = sqlalchemy.text(
-                f'DELETE FROM "{symbol}" WHERE "timestamp" = :ts AND "expiryDate" = :expiry'
-            )
-            for ts, expiry in pairs:
-                result = _execute_sql(bind, stmt, {'ts': ts, 'expiry': expiry})
-                deleted += int(result.rowcount or 0)
-        else:
-            timestamps = sorted({str(ts).strip() for ts in frame['timestamp'] if str(ts).strip()})
-            stmt = sqlalchemy.text(f'DELETE FROM "{symbol}" WHERE "timestamp" = :ts')
-            for ts in timestamps:
-                result = _execute_sql(bind, stmt, {'ts': ts})
-                deleted += int(result.rowcount or 0)
-    except Exception as exc:
-        print(f"[WARN] Could not replace existing option rows for {symbol}: {type(exc).__name__}: {exc}")
-        return 0
-    return deleted
-
-
-def valid_timestamp(value, fallback):
-    """Use fallback when NSE sends blank placeholder timestamps."""
-    if value is None:
-        return fallback
-    value = str(value).strip()
-    if not value or value in {'-', 'xx', 'None', 'nan'}:
-        return fallback
-    return value
-
-
-def get_option_chain_timestamp(data, fallback):
-    """Extract timestamp from option-chain-v3 response if available."""
-    records = data.get('records') if isinstance(data, dict) else None
-    records = records or {}
-    return valid_timestamp(
-        records.get('timestamp') or data.get('timestamp') or data.get('opt_timestamp'),
-        fallback
+        print(f"[AI] Cache refresh warning: {type(exc).__name__}: {exc}")
+
+
+# -------------------- CYCLE --------------------
+def run_cycle() -> Dict[str, Any]:
+    cycle_time = now_ist()
+    ts = snapshot_timestamp(cycle_time)
+    trade_date = cycle_time.date().isoformat()
+    print(f"[RUN] Upstox NIFTY cycle @ {ts}")
+
+    chains: List[List[Dict[str, Any]]] = []
+    actual_expiries: List[str] = []
+    for selector in OPTION_EXPIRIES:
+        chain = fetch_option_chain(selector)
+        chains.append(chain)
+        chain_expiries = sorted({str(item.get("expiry")) for item in chain if item.get("expiry")})
+        actual_expiries.extend(chain_expiries)
+        print(f"[OPTIONS] selector={selector} strikes={len(chain)} expiries={chain_expiries}")
+
+    options_df = build_options_dataframe(chains, ts)
+    if options_df.empty:
+        raise RuntimeError("Upstox option chain returned no CE/PE rows.")
+    option_count = replace_option_snapshot(option_engine(), options_df)
+    print(
+        f"[OPTIONS] stored={option_count} contracts "
+        f"expiries={sorted(options_df['expiryDate'].astype(str).unique().tolist())}"
     )
 
+    contract = search_nearest_future_contract()
+    quote_keys = [str(contract.get("instrument_key") or ""), UNDERLYING_KEY]
+    quotes = fetch_full_quotes(quote_keys)
+    future_quote = find_quote(quotes, quote_keys[0])
+    spot_quote = find_quote(quotes, UNDERLYING_KEY)
+    futures_df = build_futures_dataframe(contract, future_quote, spot_quote, ts, future_engine())
+    future_count = replace_future_snapshot(future_engine(), futures_df)
+    print(
+        f"[FUTURES] stored={future_count} contract={contract.get('trading_symbol')} "
+        f"expiry={contract.get('expiry')}"
+    )
 
-def get_live_futures_timestamp(data, fallback):
-    """Extract timestamp from liveEquity-derivatives response if available."""
-    if not isinstance(data, dict):
-        return fallback
-    return valid_timestamp(data.get('timestamp'), fallback)
-
-
-def align_to_existing_table(engine, symbol, df):
-    """Match DataFrame columns to an existing PostgreSQL table before append."""
-    if df.empty:
-        return df
-
+    cash_summary = None
     try:
-        columns = [col['name'] for col in sqlalchemy.inspect(engine).get_columns(symbol)]
-    except Exception:
-        return df
-
-    if not columns:
-        return df
-
-    out = df.copy()
-    for column in columns:
-        if column not in out.columns:
-            out[column] = None
-    return out[columns]
-
-
-def ensure_live_derivative_columns(engine, symbol):
-    """Schema-safe mode: do not add volume/noOfTrades columns because they already exist in the raw tables."""
-    try:
-        existing = {col['name'] for col in sqlalchemy.inspect(engine).get_columns(symbol)}
-    except Exception:
-        return
-
-    missing = [
-        (column, column_type)
-        for column, column_type in LIVE_DERIVATIVE_EXTRA_COLUMN_TYPES.items()
-        if column not in existing
-    ]
-    if not missing:
-        return
-
-    try:
-        with engine.begin() as conn:
-            for column, column_type in missing:
-                conn.execute(sqlalchemy.text(
-                    f'ALTER TABLE "{symbol}" ADD COLUMN IF NOT EXISTS "{column}" {column_type}'
-                ))
-        print(f"[DB] Added live derivative columns for {symbol}: {[name for name, _ in missing]}")
+        cash_summary = run_cash_cycle(ts, trade_date)
     except Exception as exc:
-        print(f"[WARN] Could not add live derivative columns for {symbol}: {type(exc).__name__}: {exc}")
+        print(f"[CASH] Warning: {type(exc).__name__}: {exc}")
+
+    nearest_expiry = sorted(set(actual_expiries))[0] if actual_expiries else None
+    refresh_option_buying_ai_cache(trade_date, nearest_expiry)
+    return {
+        "timestamp": ts,
+        "trade_date": trade_date,
+        "option_rows": option_count,
+        "future_rows": future_count,
+        "expiries": sorted(set(actual_expiries)),
+        "cash": cash_summary,
+    }
 
 
-def normalize_live_option_type(value):
-    text = str(value or '').strip().upper()
-    if text in {'CE', 'CALL', 'C'} or text.startswith('CALL'):
-        return 'CE'
-    if text in {'PE', 'PUT', 'P'} or text.startswith('PUT'):
-        return 'PE'
-    return text
+def startup_token_test() -> None:
+    print("[UPSTOX] Validating Analytics Token and NIFTY option-chain access...")
+    chain = fetch_option_chain(OPTION_EXPIRIES[0] if OPTION_EXPIRIES else "current_week")
+    expiries = sorted({str(item.get("expiry")) for item in chain if item.get("expiry")})
+    print(f"[UPSTOX] Token valid. Option-chain strikes={len(chain)} expiries={expiries}")
 
 
-def is_live_value(value):
-    if value is None:
-        return False
-    try:
-        if pd.isna(value):
-            return False
-    except Exception:
-        pass
-    text = str(value).strip()
-    return text not in {'', '-', 'xx', 'None', 'nan', 'NaN', 'NAT', 'NaT'}
+def main() -> int:
+    parser = argparse.ArgumentParser(description="NSE360 Upstox Analytics live worker")
+    parser.add_argument("--once", action="store_true", help="Run one collection cycle and exit")
+    parser.add_argument("--test-token", action="store_true", help="Validate token/API access and exit")
+    args = parser.parse_args()
 
+    require_token()
+    # Initialize schemas before the first request so configuration errors are visible immediately.
+    option_engine()
+    future_engine()
+    if ENABLE_CASH:
+        cash_engine()
 
-def option_merge_key(row):
-    expiry = parse_expiry_date(row.get('expiryDate'))
-    expiry_key = expiry.isoformat() if expiry else str(row.get('expiryDate') or '').strip()
-    side_key = normalize_live_option_type(row.get('optionType'))
-    raw_strike = row.get('strikePrice')
-    try:
-        strike_key = round(float(str(raw_strike).replace(',', '').strip()), 6)
-    except Exception:
-        strike_key = str(raw_strike or '').strip()
-    return expiry_key, side_key, strike_key
-
-
-def merge_live_option_fields(base_df, live_df):
-    """Overlay OHLC/volume/trade fields from liveEquity option rows onto option-chain rows."""
-    if base_df.empty or live_df.empty:
-        return base_df
-
-    out = base_df.copy()
-    live = live_df.copy()
-    if 'optionType' in out.columns:
-        out['optionType'] = out['optionType'].map(normalize_live_option_type)
-    if 'optionType' in live.columns:
-        live['optionType'] = live['optionType'].map(normalize_live_option_type)
-
-    merge_fields = [
-        'identifier', 'openPrice', 'highPrice', 'lowPrice', 'closePrice', 'prevClose',
-        'lastPrice', 'change', 'pChange', 'volume', 'tradedContracts', 'tradedVolume',
-        'noOfTrades', 'premiumTurnover', 'totalTurnover', 'value', 'vwap',
-        'openInterest', 'spotPrice'
-    ]
-    for field in merge_fields:
-        if field not in out.columns:
-            out[field] = None
-
-    live_map = {}
-    for _, row in live.iterrows():
-        key = option_merge_key(row)
-        live_map[key] = row
-
-    matched = 0
-    for idx, row in out.iterrows():
-        live_row = live_map.get(option_merge_key(row))
-        if live_row is None:
-            continue
-        matched += 1
-        for field in merge_fields:
-            if field in live_row.index and is_live_value(live_row.get(field)):
-                out.at[idx, field] = live_row.get(field)
-
-    if matched:
-        print(f"Merged liveEquity option OHLC/volume fields into {matched} option-chain rows.")
-    else:
-        print("[WARN] liveEquity option rows fetched but no option-chain rows matched by expiry/type/strike.")
-    return out
-
-
-def get_nearest_expiry_from_list(expiry_dates):
-    """Return nearest non-expired expiry from NSE expiry date strings."""
-    expiries = get_nearest_expiries_from_list(expiry_dates, count=1)
-    return expiries[0] if expiries else None
-
-def flatten_expiry_dates(value):
-    """Flatten NSE expiry metadata from lists/dicts into date strings."""
-    if value is None:
-        return []
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        dates = []
-        for item in value.values():
-            dates.extend(flatten_expiry_dates(item))
-        return dates
-    if isinstance(value, (list, tuple, set)):
-        dates = []
-        for item in value:
-            dates.extend(flatten_expiry_dates(item))
-        return dates
-    return []
-
-
-def get_option_expiry_from_quote_response(data, symbol):
-    """Pick current option expiry from quote-derivative metadata or dynamic fallback."""
-    expiry_dates = []
-    expiry_dates.extend(flatten_expiry_dates(data.get('expiryDates')))
-    expiry_dates.extend(flatten_expiry_dates((data.get('expiryDatesByInstrument') or {}).get('Index Options')))
-    expiry_dates.extend(flatten_expiry_dates(data.get('expiryDatesByInstrument')))
-
-    nearest = get_nearest_expiry_from_list(expiry_dates)
-    if nearest:
-        return nearest
-
-    fallback = get_dynamic_option_expiries(symbol, count=1)[0]
-    print(f"[WARN] Could not derive option expiry from quote-derivative for {symbol}; using dynamic fallback {fallback}.")
-    return fallback
-
-def get_option_expiries_from_quote_response(data, symbol, count=1):
-    """Pick current/next option expiries from quote-derivative metadata or dynamic fallback."""
-    expiry_dates = []
-    expiry_dates.extend(flatten_expiry_dates(data.get('expiryDates')))
-    expiry_dates.extend(flatten_expiry_dates((data.get('expiryDatesByInstrument') or {}).get('Index Options')))
-    expiry_dates.extend(flatten_expiry_dates(data.get('expiryDatesByInstrument')))
-
-    expiries = get_nearest_expiries_from_list(expiry_dates, count=count)
-    if len(expiries) >= count:
-        return expiries
-
-    fallback_expiries = get_dynamic_option_expiries(symbol, count=count)
-    for expiry in fallback_expiries:
-        if expiry not in expiries:
-            expiries.append(expiry)
-        if len(expiries) >= count:
-            break
-
-    selected = expiries[:count]
-    print(f"[WARN] Could not derive enough option expiries from quote-derivative for {symbol}; using dynamic fallback {selected}.")
-    return selected
-
-def build_raw_dataframe(data, symbol):
-    """Convert NSE quote-derivative JSON response into a flat raw DataFrame."""
-    stocks = data.get('stocks', [])
-    if not stocks:
-        return pd.DataFrame()
-
-    metadata_rows = []
-    trade_info_rows = []
-    other_info_rows = []
-
-    for item in stocks:
-        metadata_rows.append(item.get('metadata') or {})
-        order_book = item.get('marketDeptOrderBook') or {}
-        trade_info_rows.append(order_book.get('tradeInfo') or {})
-        other_info_rows.append(order_book.get('otherInfo') or {})
-
-    df1 = pd.DataFrame(metadata_rows).drop(columns=['identifier'], errors='ignore')
-    df1.rename(columns={'numberOfContractsTraded': 'tradedContracts'}, inplace=True, errors='ignore')
-
-    df2 = pd.DataFrame(trade_info_rows).rename(columns={
-        'vmap': 'vwap',
-        'changeinOpenInterest': 'changeinOI',
-        'pchangeinOpenInterest': 'pchangeinOI'
-    })
-
-    df3 = pd.DataFrame(other_info_rows).drop(columns=[
-        'settlementPrice',
-        'clientWisePositionLimits',
-        'marketWidePositionLimits'
-    ], errors='ignore')
-
-    df = pd.concat([df1, df2, df3], axis=1)
-
-    # If the same column appears from multiple JSON sections, keep the first copy.
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-
-    # Raw-only mode: do not crash or filter out rows when openInterest is missing.
-    if 'openInterest' not in df.columns:
-        print(f"[WARN] openInterest column missing for {symbol}; storing raw rows without OI filter.")
-
-    actual_symbol = (data.get('info') or {}).get('symbol', symbol)
-    df.insert(0, 'symbol', actual_symbol)
-    df['spotPrice'] = data.get('underlyingValue')
-
-    # Kept from your earlier script for DB compatibility.
-    df.replace('-', 'xx', inplace=True)
-
-    if 'tickSize' in df.columns:
-        df.drop(columns=['tickSize'], inplace=True)
-
-    return df
-
-
-def build_option_chain_v3_dataframe(data, symbol):
-    """Convert NSE option-chain-v3 JSON into rows compatible with options storage."""
-    records = data.get('records') or data
-    chain_rows = records.get('data') or data.get('data') or []
-    if not chain_rows:
-        return pd.DataFrame()
-
-    spot_price = (
-        records.get('underlyingValue')
-        or data.get('underlyingValue')
-        or (data.get('filtered') or {}).get('underlyingValue')
+    print(
+        f"[READY] NSE360 Upstox worker started. source=UPSTOX_ANALYTICS "
+        f"underlying={UNDERLYING_KEY} expiries={OPTION_EXPIRIES} "
+        f"market={MARKET_START.strftime('%H:%M')}-{MARKET_END.strftime('%H:%M')} IST"
     )
-
-    rows = []
-    for item in chain_rows:
-        for option_type in ('CE', 'PE'):
-            option = item.get(option_type)
-            if not isinstance(option, dict):
-                continue
-
-            row = option.copy()
-            row.setdefault('strikePrice', item.get('strikePrice'))
-            row.setdefault('expiryDate', item.get('expiryDate'))
-            row['optionType'] = option_type
-            row['instrumentType'] = 'Index Options'
-            row['symbol'] = row.get('underlying') or symbol
-            row['spotPrice'] = spot_price or row.get('underlyingValue')
-            rows.append(row)
-
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    df.rename(columns={
-        'changeinOpenInterest': 'changeinOI',
-        'pchangeinOpenInterest': 'pchangeinOI',
-        'totalTradedVolume': 'tradedContracts'
-    }, inplace=True, errors='ignore')
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-    df.replace('-', 'xx', inplace=True)
-    return df
-
-
-def build_live_options_dataframe(data, symbol):
-    """Convert NSE liveEquity-derivatives JSON into current raw option rows."""
-    rows = data.get('data') or []
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    if 'underlying' in df.columns:
-        df = df[df['underlying'].astype(str).str.upper() == symbol].copy()
-
-    if 'instrumentType' in df.columns:
-        df = df[df['instrumentType'].astype(str).str.upper() == 'OPTIDX'].copy()
-
-    if df.empty:
-        return df
-
-    df.rename(columns={
-        'underlying': 'symbol',
-        'premiumTurnOver': 'premiumTurnover',
-        'changeinOpenInterest': 'changeinOI',
-        'pchangeinOpenInterest': 'pchangeinOI'
-    }, inplace=True, errors='ignore')
-    df['instrumentType'] = 'Index Options'
-    if 'optionType' in df.columns:
-        df['optionType'] = df['optionType'].map(normalize_live_option_type)
-    if 'volume' in df.columns:
-        df['tradedContracts'] = df['volume']
-        df['tradedVolume'] = df['volume']
-    if 'underlyingValue' in df.columns:
-        df['spotPrice'] = df['underlyingValue']
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-    df.replace('-', 'xx', inplace=True)
-    return df
-
-
-def build_live_futures_dataframe(data, symbol):
-    """Convert NSE liveEquity-derivatives JSON into current raw futures rows."""
-    rows = data.get('data') or []
-    if not rows:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    if 'underlying' in df.columns:
-        df = df[df['underlying'].astype(str).str.upper() == symbol].copy()
-
-    if 'instrumentType' in df.columns:
-        df = df[df['instrumentType'].astype(str).str.upper() == 'FUTIDX'].copy()
-
-    if df.empty:
-        return df
-
-    df.rename(columns={
-        'underlying': 'symbol',
-        'premiumTurnOver': 'premiumTurnover',
-        'totalTradedVolume': 'tradedContracts',
-        'changeinOpenInterest': 'changeinOI',
-        'pchangeinOpenInterest': 'pchangeinOI'
-    }, inplace=True, errors='ignore')
-    df['instrumentType'] = 'Index Futures'
-    if 'volume' in df.columns:
-        df['tradedContracts'] = df['volume']
-        df['tradedVolume'] = df['volume']
-    if 'underlyingValue' in df.columns:
-        df['spotPrice'] = df['underlyingValue']
-    df = df.loc[:, ~df.columns.duplicated()].copy()
-    df.replace('-', 'xx', inplace=True)
-    return df
-
-
-def fetch_live_options(symbol):
-    """Fetch option rows from NSE liveEquity-derivatives endpoint."""
-    index_param = OPTION_INDEX_PARAM.get(symbol)
-    if not index_param:
-        return pd.DataFrame(), None
-
-    request_headers = headers.copy()
-    request_headers['referer'] = 'https://www.nseindia.com/market-data/equity-derivatives-watch'
-    url = f'https://www.nseindia.com/api/liveEquity-derivatives?index={quote(index_param)}'
-    response = session.get(url, headers=request_headers, timeout=15)
-    response.raise_for_status()
-    opt_data = response.json()
-    return build_live_options_dataframe(opt_data, symbol), opt_data
-
-
-def fetch_live_futures(symbol):
-    """Fetch futures rows from NSE liveEquity-derivatives endpoint."""
-    index_param = FUTURES_INDEX_PARAM.get(symbol)
-    if not index_param:
-        return pd.DataFrame(), None
-
-    request_headers = headers.copy()
-    request_headers['referer'] = 'https://www.nseindia.com/market-data/equity-derivatives-watch'
-    url = f'https://www.nseindia.com/api/liveEquity-derivatives?index={quote(index_param)}'
-    response = session.get(url, headers=request_headers, timeout=15)
-    response.raise_for_status()
-    fut_data = response.json()
-    return build_live_futures_dataframe(fut_data, symbol), fut_data
-
-
-
-def fetch_option_contract_info_expiries(symbol, count=1):
-    """
-    Fetch option expiries from NSE contract-info endpoint.
-
-    Source endpoint:
-      https://www.nseindia.com/api/option-chain-contract-info?symbol=NIFTY
-
-    This endpoint returns the full expiryDates list used to select current
-    and next expiry for option-chain-v3 calls.
-    """
-    request_headers = headers.copy()
-    request_headers['referer'] = 'https://www.nseindia.com/option-chain'
-    url = f'https://www.nseindia.com/api/option-chain-contract-info?symbol={quote(symbol)}'
-
-    response = session.get(url, headers=request_headers, timeout=15)
-    response.raise_for_status()
-    data = response.json()
-
-    expiry_dates = flatten_expiry_dates(data.get('expiryDates'))
-    expiries = get_nearest_expiries_from_list(expiry_dates, count=count)
-
-    if expiries:
-        print(f"Contract-info expiries for {symbol}: {expiries}")
-    else:
-        print(f"[WARN] option-chain-contract-info did not return usable expiries for {symbol}. Response keys: {list(data.keys()) if isinstance(data, dict) else []}")
-
-    return expiries, data
-
-
-
-def fetch_option_chain_v3(symbol, expiry):
-    """Fetch options rows from NSE's option-chain-v3 endpoint for one expiry."""
-    if not expiry:
-        return pd.DataFrame(), None
-
-    request_headers = headers.copy()
-    request_headers['referer'] = 'https://www.nseindia.com/option-chain'
-    url = (
-        'https://www.nseindia.com/api/option-chain-v3'
-        f'?type=Indices&symbol={quote(symbol)}&expiry={quote(expiry)}'
-    )
-    response = session.get(url, headers=request_headers, timeout=15)
-    response.raise_for_status()
-    oc_data = response.json()
-    return build_option_chain_v3_dataframe(oc_data, symbol), oc_data
-
-
-
-def fetch_quote_derivative_optional(symbol):
-    """
-    Optional quote-derivative fetch.
-
-    NSE can return 404 for /api/quote-derivative?symbol=NIFTY. This helper
-    never stops the cycle. Options are fetched from contract-info +
-    option-chain-v3, and futures are fetched from liveEquity-derivatives.
-    """
-    try:
-        _prime_nse_session(symbol)
-        request_headers = headers.copy()
-        request_headers['referer'] = f'https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}'
-        url = f'https://www.nseindia.com/api/quote-derivative?symbol={quote(symbol)}'
-        response = session.get(url, headers=request_headers, timeout=15)
-
-        if response.status_code == 404:
-            print(f"[INFO] quote-derivative endpoint returned 404 for {symbol}; continuing with contract-info/option-chain-v3 + live futures.")
-            return {}, pd.DataFrame()
-
-        response.raise_for_status()
-        data = response.json()
-        return data, build_raw_dataframe(data, symbol)
-
-    except (requests.exceptions.RequestException, json.JSONDecodeError) as exc:
-        print(f"[INFO] Optional quote-derivative fetch failed for {symbol}: {type(exc).__name__}: {exc}")
-        return {}, pd.DataFrame()
-
-
-
-# ============================== CORE FETCH ==============================
-def getIndexData(url, symbol):
-    print('=' * 50)
-
-    try:
-        for attempt in range(1, 4):
-            try:
-                header, dct = _read_cookies_file()
-                _install_cookies(header, dct)
-                _prime_nse_session(symbol)
-
-                now_ts = datetime.now().strftime('%d-%b-%Y %H:%M:%S')
-                fut_ts = now_ts
-                opt_ts = now_ts
-
-                option_expiry_count = 2 if symbol == 'NIFTY' else 1
-
-                # 1) Option expiries: use contract-info first.
-                try:
-                    option_expiries, contract_info_data = fetch_option_contract_info_expiries(symbol, count=option_expiry_count)
-                except Exception as expiry_error:
-                    option_expiries = []
-                    print(f"[WARN] Could not fetch option-chain-contract-info expiries for {symbol}: {type(expiry_error).__name__}: {expiry_error}")
-
-                # 2) Optional quote-derivative. Do not fail the cycle if it is 404.
-                data, df = fetch_quote_derivative_optional(symbol)
-
-                if not option_expiries and isinstance(data, dict):
-                    option_expiries = get_option_expiries_from_quote_response(data, symbol, count=option_expiry_count)
-
-                if not option_expiries:
-                    option_expiries = get_dynamic_option_expiries(symbol, count=option_expiry_count)
-                    print(f"[WARN] Using dynamic option expiry fallback for {symbol}: {option_expiries}")
-
-                print(f"Selected option expiries for {symbol}: {option_expiries}")
-
-                # 3) Options: fetch ALL strikes for each selected expiry from option-chain-v3.
-                fetched_option_frames = []
-                for expiry in option_expiries:
-                    print(f"Fetching Options data for {symbol} from option-chain-v3 expiry {expiry}...")
-                    fetched_optdf, oc_data = fetch_option_chain_v3(symbol, expiry)
-                    if fetched_optdf.empty:
-                        print(f"[WARN] option-chain-v3 returned no rows for {symbol} expiry {expiry}. Response keys: {list(oc_data.keys()) if oc_data else []}")
-                    else:
-                        fetched_option_frames.append(fetched_optdf)
-                        if oc_data:
-                            opt_ts = get_option_chain_timestamp(oc_data, opt_ts)
-
-                optdf = pd.concat(fetched_option_frames, ignore_index=True) if fetched_option_frames else pd.DataFrame()
-                if not optdf.empty:
-                    optdf = optdf.loc[:, ~optdf.columns.duplicated()].copy()
-
-                # 3b) Rich option OHLC/volume/noOfTrades from liveEquity-derivatives.
-                try:
-                    print(f"Fetching rich Options data for {symbol} from liveEquity-derivatives...")
-                    live_optdf, live_opt_data = fetch_live_options(symbol)
-                    if live_opt_data:
-                        opt_ts = get_live_futures_timestamp(live_opt_data, opt_ts)
-                    if not live_optdf.empty:
-                        live_optdf = live_optdf.loc[:, ~live_optdf.columns.duplicated()].copy()
-                        if option_expiries and 'expiryDate' in live_optdf.columns:
-                            live_optdf = pd.concat(
-                                [filter_by_expiry_date(live_optdf, expiry) for expiry in option_expiries],
-                                ignore_index=True,
-                            )
-                        if not optdf.empty:
-                            optdf = merge_live_option_fields(optdf, live_optdf)
-                        else:
-                            optdf = live_optdf
-                            print(f"[WARN] option-chain-v3 empty; using liveEquity option rows for {symbol}.")
-                        live_cols_present = [c for c in ["volume", "noOfTrades", "openPrice", "highPrice", "lowPrice", "lastPrice", "openInterest", "premiumTurnover"] if c in optdf.columns]
-                        print(f"[INFO] Option liveEquity fields available for {symbol}: {live_cols_present}")
-                    else:
-                        print(f"[WARN] liveEquity-derivatives returned no option rows for {symbol}. Response keys: {list(live_opt_data.keys()) if live_opt_data else []}")
-                except Exception as live_opt_error:
-                    print(f"[WARN] Rich live option fetch skipped for {symbol}: {type(live_opt_error).__name__}: {live_opt_error}")
-
-                # 4) Futures: use quote-derivative if it still returns rows, otherwise liveEquity-derivatives.
-                futdf = pd.DataFrame()
-                nearest_fut_expiry = None
-
-                if not df.empty:
-                    nearest_fut_expiry = get_nearest_expiry(df, 'Index Futures')
-                    if nearest_fut_expiry:
-                        print(f"Selected futures expiry for {symbol}: {nearest_fut_expiry}")
-                        futdf = df[df['instrumentType'] == 'Index Futures'].copy()
-                        futdf = filter_by_expiry_date(futdf, nearest_fut_expiry)
-                        if isinstance(data, dict):
-                            fut_ts = valid_timestamp(data.get('fut_timestamp') or data.get('timestamp'), fut_ts)
-
-                if futdf.empty:
-                    print(f"Fetching Futures data for {symbol} from liveEquity-derivatives...")
-                    futdf, fut_data = fetch_live_futures(symbol)
-                    if fut_data:
-                        fut_ts = get_live_futures_timestamp(fut_data, fut_ts)
-                    nearest_fut_expiry = get_nearest_expiry(futdf, 'Index Futures')
-                    if nearest_fut_expiry:
-                        print(f"Selected futures expiry for {symbol}: {nearest_fut_expiry}")
-                        futdf = filter_by_expiry_date(futdf, nearest_fut_expiry)
-                    else:
-                        print(f"[WARN] Could not derive futures expiry for {symbol}.")
-                    if futdf.empty:
-                        print(f"[WARN] liveEquity-derivatives returned no futures rows for {symbol}. Response keys: {list(fut_data.keys()) if fut_data else []}")
-
-                if futdf.empty and optdf.empty:
-                    if attempt < 3:
-                        print('No option/futures rows received. Refreshing cookies/session and retrying...')
-                        _refresh_nse_session(f'empty NSE response for {symbol}, attempt {attempt}')
-                        time.sleep(3 * attempt + random.uniform(0, 1))
-                        continue
-                    break
-
-                # ---- Futures raw write ----
-                if not futdf.empty:
-                    print(f"Upserting RAW Futures data for {symbol} @ {fut_ts}...")
-                    if 'timestamp' in futdf.columns:
-                        futdf.drop(columns=['timestamp'], inplace=True)
-                    futdf.insert(len(futdf.columns), 'timestamp', fut_ts)
-                    # Existing futures table already has volume/noOfTrades fields.
-                    # Do not add new fields; align into current table schema only.
-                    ensure_live_derivative_columns(engine1, symbol)
-                    futdf = align_to_existing_table(engine1, symbol, futdf)
-                    with engine1.begin() as con1:
-                        replaced = delete_existing_timestamp_rows(con1, symbol, fut_ts)
-                        if replaced:
-                            print(f"[UPSERT] Replaced {replaced} existing futures rows for {symbol} @ {fut_ts}.")
-                        futdf.to_sql(symbol, con=con1, if_exists='append', index=False)
-                    print(f"Futures RAW data upserted @ {datetime.now()}")
-                else:
-                    print(f"No futures rows found for {symbol} @ {fut_ts}.")
-
-                # ---- Options raw write ----
-                if not optdf.empty:
-                    print(f"Upserting RAW Options data for {symbol} @ {opt_ts}...")
-                    if 'timestamp' in optdf.columns:
-                        optdf.drop(columns=['timestamp'], inplace=True)
-                    optdf.insert(len(optdf.columns), 'timestamp', opt_ts)
-                    # Existing options table already has volume/noOfTrades fields.
-                    # Do not add new fields; align into current table schema only.
-                    ensure_live_derivative_columns(engine2, symbol)
-                    optdf = align_to_existing_table(engine2, symbol, optdf)
-                    with engine2.begin() as con2:
-                        replaced = delete_existing_option_snapshot_rows(con2, symbol, optdf)
-                        if replaced:
-                            print(f"[UPSERT] Replaced {replaced} existing option rows for {symbol} @ {opt_ts}.")
-                        optdf.to_sql(symbol, con=con2, if_exists='append', index=False)
-                    print(f"Options RAW data upserted @ {datetime.now()}")
-                else:
-                    print(f"No option rows found for {symbol} @ {opt_ts}.")
-
-                primary_option_expiry = option_expiries[0] if option_expiries else None
-                refresh_option_buying_ai_cache(
-                    symbol,
-                    trade_date=datetime.now().strftime('%Y-%m-%d'),
-                    expiry=primary_option_expiry,
-                )
-
-                break
-
-            except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
-                print(f"[ERROR] Attempt {attempt} for {symbol} - {e}")
-                print('Refreshing cookies and retrying...')
-                _refresh_nse_session(f'{symbol} request failure, attempt {attempt}')
-                time.sleep(3 * attempt + random.uniform(0, 1))
-
-            except Exception as e:
-                # Do not stop the whole market loop because of one symbol/data-shape issue.
-                print(f"[ERROR] {symbol} failed: {type(e).__name__}: {e}")
-                try:
-                    engine1.dispose()
-                    engine2.dispose()
-                except Exception:
-                    pass
-                break
-
-    finally:
-        print('Connections closed.')
-        print('=' * 50)
-
-
-
-def ist_now():
-    return datetime.now(IST)
-
-
-def market_is_open(now=None):
-    now = now or ist_now()
-    return now.weekday() < 5 and MARKET_START <= now.time().replace(tzinfo=None) <= MARKET_END
-
-
-def main():
-    print('[READY] NIFTY cloud live worker started. Market window 09:14-15:50 IST.', flush=True)
-    session_ready = False
+    startup_token_test()
+    if args.test_token:
+        return 0
 
     while True:
-        now = ist_now()
-        if not market_is_open(now):
-            if now.minute % 15 == 0 and now.second < 5:
-                print(f'[WAIT] Outside market hours: {now:%d-%b-%Y %H:%M:%S IST}', flush=True)
-            time.sleep(30)
-            continue
-
-        if not session_ready:
-            session_ready = _bootstrap_cookies()
-            if not session_ready:
-                print('[WAIT] NSE session is not ready; retrying in 60 seconds without crashing.', flush=True)
-                time.sleep(60)
-                continue
-
-        cycle_failed = False
-        for symbol in symbols:
+        moment = now_ist()
+        if RUN_OUTSIDE_MARKET or market_is_open(moment) or args.once:
             try:
-                url = f'https://www.nseindia.com/api/quote-derivative?symbol={symbol}'
-                getIndexData(url, symbol)
+                result = run_cycle()
+                print(
+                    f"[DONE] {result['timestamp']} options={result['option_rows']} "
+                    f"futures={result['future_rows']}"
+                )
             except Exception as exc:
-                cycle_failed = True
-                session_ready = False
-                print(f'[ERROR] Unhandled live cycle error for {symbol}: {type(exc).__name__}: {exc}', flush=True)
-                _refresh_nse_session(f'unhandled {symbol} cycle error')
+                print(f"[ERROR] Cycle failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        else:
+            print(
+                f"[WAIT] Outside market window @ {moment.strftime('%d-%b-%Y %H:%M:%S')} IST; "
+                "worker remains online."
+            )
 
-        try:
-            run_cash_money_flow_cycle()
-        except Exception as exc:
-            print(f'[WARN] Cash money-flow cycle failed: {type(exc).__name__}: {exc}', flush=True)
+        if args.once:
+            break
+        time.sleep(seconds_to_next_cycle())
 
-        if cycle_failed:
-            print('[WAIT] One or more NSE calls failed; session will be rebuilt on the next cycle.', flush=True)
-
-        print(f'[SLEEP] Next {WAIT_SECONDS}-second cycle at {ist_now():%d-%b-%Y %H:%M:%S IST}', flush=True)
-        time.sleep(max(1.0, WAIT_SECONDS - time.time() % WAIT_SECONDS))
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())
