@@ -36,11 +36,14 @@ from pathlib import Path
 import webbrowser
 from cloud_db import make_schema_engine
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
 import pandas as pd
 import sqlalchemy
+
+IST = ZoneInfo("Asia/Kolkata")
 
 
 BASE_DIR = os.getenv("APP_DATA_DIR", str(Path(__file__).resolve().parent / "data"))
@@ -962,7 +965,7 @@ def build_dashboard_payload(symbol, band, trade_date=None, expiry=None, chart_st
         "expiry": expiry,
         "availableDates": available_dates,
         "availableExpiries": available_expiries,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "timestamp": latest_ts,
         "previousTimestamp": previous_ts,
         "firstTimestamp": first_ts,
@@ -1160,7 +1163,7 @@ def build_strike_full_day_payload(symbol, trade_date=None, strike_value=None, ex
         "lastTimestamp": last_ts,
         "points": len(rows),
         "futuresPoints": len(futures_series),
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "rows": rows,
     }
 
@@ -1407,7 +1410,7 @@ def build_expiry_roc_matrix_payload(symbol, trade_date=None, expiry=None, mode="
         "firstTimestamp": rows[0]["timestamp"] if rows else "",
         "lastTimestamp": rows[-1]["timestamp"] if rows else "",
         "points": len(rows),
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "rows": rows,
     }
 
@@ -1669,7 +1672,7 @@ def build_nse_oc_payload(symbol, trade_date=None, expiry=None, band=5):
         "availableExpiries": available_expiries,
         "timestamp": latest_ts,
         "previousTimestamp": "",
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": spot,
         "atm": atm,
         "strikeStep": step,
@@ -1824,7 +1827,7 @@ def build_big_player_presence_payload(symbol, trade_date=None, expiry=None, thre
         "threshold": threshold,
         "lotSize": lot_size,
         "timestamp": latest_ts,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": spot,
         "rows": rows,
         "count": len(rows),
@@ -1927,7 +1930,7 @@ def build_nse_oc_strike_chart_payload(symbol, trade_date=None, expiry=None, stri
         "firstTimestamp": points[0]["timestamp"] if points else "",
         "lastTimestamp": points[-1]["timestamp"] if points else "",
         "pointsCount": len(points),
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "points": points,
     }
 
@@ -3675,7 +3678,7 @@ def build_eod_participation_payload_from_db(symbol, trade_date=None, expiry=None
         'availableDates': available_dates,
         'availableExpiries': available_expiries,
         'expiry': selected_expiry,
-        'generatedAt': datetime.now().strftime('%d-%b-%Y %H:%M:%S'),
+        'generatedAt': datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S'),
         'loadedFromDbTables': True,
         'source': 'PostgreSQL result tables',
         'error': '',
@@ -3694,7 +3697,7 @@ def build_eod_participation_payload_from_db(symbol, trade_date=None, expiry=None
         'volumeSpurts': volume_spurts,
         'memory': memory,
         'memoryUpdatedAt': (memory[0].get('updatedAt') if memory else ''),
-        'updatedAt': datetime.now().strftime('%d-%b-%Y %H:%M:%S'),
+        'updatedAt': datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S'),
         'disclaimer': 'Loaded directly from PostgreSQL EOD result tables. Participant OI/volume remains participant-wise, not strike-wise; strike player labels are probabilistic.',
     }
 
@@ -3842,7 +3845,7 @@ def build_eod_participation_payload(symbol, trade_date=None, expiry=None):
             'availableDates': dates,
             'availableExpiries': available_expiries,
             'expiry': ((core.get('strikes') or {}).get('expiry') or expiry or ''),
-            'generatedAt': datetime.now().strftime('%d-%b-%Y %H:%M:%S'),
+            'generatedAt': datetime.now(IST).strftime('%d-%b-%Y %H:%M:%S'),
             'searchDirs': [str(path) for path in eod_search_dirs()],
             'error': (core.get('strikes') or {}).get('error') or '',
             'participantOiFile': core.get('participantOiFile'),
@@ -4823,7 +4826,7 @@ def build_live_player_strike_decoder_payload(symbol, trade_date=None, expiry=Non
         "band": band,
         "confirmationWindow": len(confirmation_timestamps),
         "confirmationPairs": len(pair_signal_maps),
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "eodBias": eod_bias,
         "futures": latest_future or {},
         "memoryWrite": memory_write,
@@ -13013,7 +13016,7 @@ def build_dashboard_payload_lite(symbol, band, trade_date=None, expiry=None):
         "expiry": expiry,
         "availableDates": available_dates,
         "availableExpiries": available_expiries,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "timestamp": latest_ts,
         "previousTimestamp": previous_ts,
         "firstTimestamp": latest_ts,
@@ -13715,7 +13718,7 @@ def build_eod_participation_payload(symbol, trade_date=None, expiry=None):
             "availableDates": dates,
             "availableExpiries": available_expiries,
             "expiry": selected_expiry,
-            "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+            "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
             "error": (core.get("strikes") or {}).get("error") or "",
             "participantOiFile": core.get("participantOiFile"),
             "participantVolFile": core.get("participantVolFile"),
@@ -13895,7 +13898,7 @@ def build_eod_participation_payload(symbol, trade_date=None, expiry=None):
             "availableDates": dates,
             "availableExpiries": available_expiries,
             "expiry": selected_expiry,
-            "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+            "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
             "error": (core.get("strikes") or {}).get("error") or "",
             "participantOiFile": core.get("participantOiFile"),
             "participantVolFile": core.get("participantVolFile"),
@@ -14507,7 +14510,7 @@ def build_eod_participation_payload_from_results_fast(symbol, trade_date=None, e
         "availableDates": dates,
         "availableExpiries": available_expiries,
         "expiry": selected_expiry,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "error": "",
         "participantOiFile": "db:nse_participant_bias_daily",
         "participantVolFile": "db:nse_participant_bias_daily",
@@ -15201,7 +15204,7 @@ def build_dashboard_payload(symbol, band, trade_date=None, expiry=None, chart_st
         "expiry": expiry,
         "availableDates": available_dates,
         "availableExpiries": available_expiries,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "timestamp": latest_ts,
         "previousTimestamp": previous_ts,
         "firstTimestamp": first_ts,
@@ -16222,7 +16225,7 @@ def build_big_player_presence_payload(symbol, trade_date=None, expiry=None, thre
         "lotSize": lot_size,
         "timestamp": ctx["latestTs"],
         "previousTimestamp": ctx["previousTs"],
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": spot,
         "rows": rows,
         "count": len(rows),
@@ -16832,7 +16835,7 @@ def build_360_money_flow_payload(symbol, trade_date=None, expiry=None, band=20):
         "availableExpiries": available_expiries,
         "timestamp": ctx.get("latestTs"),
         "previousTimestamp": ctx.get("previousTs"),
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": spot,
         "atm": atm,
         "strikeStep": step,
@@ -17773,7 +17776,7 @@ def build_360_money_flow_payload(symbol, trade_date=None, expiry=None, band=20, 
         "previousTimestamp": timestamps[start_idx - 1] if start_idx > 0 else "",
         "firstTimestamp": timestamps[0],
         "lastTimestamp": timestamps[-1],
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": spot,
         "atm": atm,
         "strikeStep": step,
@@ -18375,7 +18378,7 @@ def build_360_smart_flow_v2_payload(symbol, trade_date=None, expiry=None, band=2
         "symbol": symbol, "date": trade_date, "expiry": expiry,
         "availableDates": available_dates, "availableExpiries": available_expiries,
         "timestamp": base.get("timestamp"), "previousTimestamp": base.get("previousTimestamp"),
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": base.get("spot"), "atm": base.get("atm"), "strikeStep": base.get("strikeStep"),
         "band": band, "moveThreshold": move_threshold,
         "summary": {
@@ -18958,7 +18961,7 @@ def build_360_expiry_memory_payload(symbol, trade_date=None, expiry=None, mode="
         "availableExpiries": available_expiries,
         "firstTimestamp": first_ts,
         "currentTimestamp": current_ts,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "spot": latest_spot,
         "atm": atm,
         "strikeStep": step,
@@ -19648,7 +19651,7 @@ def _v11842_fast_trade_decision_payload(symbol, trade_date=None, expiry=None, ba
         "expiry": expiry,
         "availableDates": available_dates,
         "availableExpiries": available_expiries,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "tradeDecision": trade_decision,
         "optionBuyingSummary": option_buying.get("summary") or {},
         "topOptionCandidate": trade_decision.get("candidate") or {},
@@ -19836,7 +19839,7 @@ def _v11839_master_payload(symbol, trade_date=None, expiry=None, band=5):
         "expiry": expiry,
         "availableDates": available_dates,
         "availableExpiries": available_expiries,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "tradeDecision": trade_decision,
         "optionBuyingSummary": option_buying.get("summary") or {},
         "topOptionCandidate": trade_decision.get("candidate") or {},
@@ -22134,7 +22137,7 @@ def build_strike_compare_payload(symbol, trade_date_a=None, time_a=None, trade_d
             "items": items,
             "diffRows": [],
             "formula": "COI/VOL = raw changeinOI / raw NSE option-chain Volume (DB noOfTrades). COI/OI % = raw changeinOI / raw openInterest * 100 at the selected timestamp.",
-            "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+            "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
             "note": f"Multi-strike compare: {len(limited_strikes)} strike(s).",
         }
 
@@ -22170,7 +22173,7 @@ def build_strike_compare_payload(symbol, trade_date_a=None, time_a=None, trade_d
         "right": right,
         "diffRows": _v11866_diff(left, right),
         "formula": "COI/VOL = raw changeinOI / raw NSE option-chain Volume (DB noOfTrades). COI/OI % = raw changeinOI / raw openInterest * 100 at the selected timestamp.",
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
     }
 # ============================== V11.8.67 HERMES BRIEF ==============================
 # Compact Telegram-style smart-money brief built from transparent 360 dashboard layers.
@@ -22379,7 +22382,7 @@ def build_360_hermes_brief_payload(symbol, trade_date=None, expiry=None, band=5,
         "minutes": minutes,
         "firstTimestamp": first_ts,
         "currentTimestamp": current_ts,
-        "generatedAt": datetime.now().strftime("%d-%b-%Y %H:%M:%S"),
+        "generatedAt": datetime.now(IST).strftime("%d-%b-%Y %H:%M:%S"),
         "briefText": "\n".join(brief_lines),
         "cards": {
             "spot": spot,
