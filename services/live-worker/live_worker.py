@@ -52,6 +52,7 @@ ALLOWED_SYMBOLS = {'NIFTY'}
 IST = ZoneInfo('Asia/Kolkata')
 MARKET_START = dtime(9, 14)
 MARKET_END = dtime(15, 50)
+NSE_COOKIE_HEADER = os.getenv('NSE_COOKIE_HEADER', '').strip()
 
 WAIT_SECONDS = 60  # 1 minute between cycles
 
@@ -204,69 +205,161 @@ print(f"Symbols enabled for raw storage: {', '.join(symbols)}")
 
 
 # ================== COOKIE HELPERS ==================
-def _read_cookies_file():
-    """
-    Returns (cookie_header_str, cookie_dict_or_None).
-
-    - If cookies.txt contains JSON dict, convert it to a cookie header.
-    - If cookies.txt contains raw cookie header text, use it directly.
-    """
-    with open(COOKIES_PATH, 'r') as f:
-        txt = f.read().strip()
+def _cookie_dict_from_text(text):
+    """Parse JSON or a raw Cookie header into a dictionary."""
+    raw = str(text or '').strip()
+    if not raw:
+        return {}
 
     try:
-        cookie_dict = json.loads(txt)
-        header = '; '.join(f'{k}={v}' for k, v in cookie_dict.items())
-        return header, cookie_dict
-    except Exception:
-        cookie_dict = {}
-        for part in txt.split(';'):
-            if '=' not in part:
-                continue
-            key, value = part.split('=', 1)
-            key = key.strip()
-            if key:
-                cookie_dict[key] = value.strip()
-        return txt, cookie_dict or None
-
-
-def _install_cookies(cookie_header, cookie_dict):
-    """Push cookies into requests session and headers."""
-    if cookie_dict:
-        for k, v in cookie_dict.items():
-            session.cookies.set(k, v)
-    # Let requests build Cookie from session.cookies so cookies collected during
-    # NSE warm-up calls are included too.
-    headers.pop('cookie', None)
-
-
-def _prime_nse_session(symbol=None):
-    """Warm NSE session so anti-bot/session cookies are attached before API calls."""
-    session.get('https://www.nseindia.com/', headers=headers, timeout=15)
-    if symbol:
-        quote_headers = headers.copy()
-        quote_headers['referer'] = f'https://www.nseindia.com/get-quotes/derivatives?symbol={symbol}'
-        session.get(quote_headers['referer'], headers=quote_headers, timeout=15)
-
-
-def _bootstrap_cookies():
-    """Ensure cookies are available. Refresh with autocookie if needed."""
-    try:
-        header, dct = _read_cookies_file()
-        _install_cookies(header, dct)
-        _prime_nse_session()
-        return
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            return {str(k): str(v) for k, v in parsed.items() if str(k).strip()}
     except Exception:
         pass
 
-    print('[COOKIES] Refreshing via autocookie.getCookies() ...')
-    autocookie.getCookies()
-    header, dct = _read_cookies_file()
-    _install_cookies(header, dct)
-    _prime_nse_session()
+    cookie_dict = {}
+    for part in raw.split(';'):
+        if '=' not in part:
+            continue
+        key, value = part.split('=', 1)
+        key = key.strip()
+        if key:
+            cookie_dict[key] = value.strip()
+    return cookie_dict
 
 
-_bootstrap_cookies()
+def _read_cookies_file():
+    """Return (cookie_header, cookie_dict); missing/empty files are allowed."""
+    if not os.path.exists(COOKIES_PATH):
+        return '', {}
+    with open(COOKIES_PATH, 'r', encoding='utf-8') as handle:
+        text = handle.read().strip()
+    cookie_dict = _cookie_dict_from_text(text)
+    header = '; '.join(f'{k}={v}' for k, v in cookie_dict.items())
+    return header, cookie_dict
+
+
+def _write_session_cookies():
+    """Persist cookies obtained by the worker's own requests.Session."""
+    cookie_dict = session.cookies.get_dict()
+    if not cookie_dict:
+        return 0
+    temp_path = COOKIES_PATH + '.tmp'
+    with open(temp_path, 'w', encoding='utf-8') as handle:
+        handle.write(';'.join(f'{k}={v}' for k, v in cookie_dict.items()))
+    os.replace(temp_path, COOKIES_PATH)
+    return len(cookie_dict)
+
+
+def _install_cookies(_cookie_header, cookie_dict):
+    """Push cookies into the shared requests session."""
+    if cookie_dict:
+        for key, value in cookie_dict.items():
+            session.cookies.set(key, value)
+    headers.pop('cookie', None)
+
+
+def _install_configured_cookies():
+    """Load optional env cookies first, then any persisted cookie file."""
+    installed = 0
+    env_cookies = _cookie_dict_from_text(NSE_COOKIE_HEADER)
+    if env_cookies:
+        _install_cookies('', env_cookies)
+        installed += len(env_cookies)
+        print(f'[COOKIES] Installed {len(env_cookies)} cookies from NSE_COOKIE_HEADER.', flush=True)
+
+    try:
+        _header, file_cookies = _read_cookies_file()
+        if file_cookies:
+            _install_cookies('', file_cookies)
+            installed += len(file_cookies)
+            print(f'[COOKIES] Installed {len(file_cookies)} cookies from cookies.txt.', flush=True)
+    except Exception as exc:
+        print(f'[COOKIES] Could not read cookies.txt: {type(exc).__name__}: {exc}', flush=True)
+    return installed
+
+
+def _prime_nse_session(symbol=None, verbose=False):
+    """Warm the shared NSE session; cookies are optional, HTTP blocks are not."""
+    warm_urls = [
+        'https://www.nseindia.com/',
+        'https://www.nseindia.com/option-chain',
+        'https://www.nseindia.com/market-data/equity-derivatives-watch',
+    ]
+    if symbol:
+        warm_urls.append(f'https://www.nseindia.com/get-quotes/derivatives?symbol={quote(symbol)}')
+
+    html_headers = headers.copy()
+    html_headers['accept'] = (
+        'text/html,application/xhtml+xml,application/xml;q=0.9,'
+        'image/avif,image/webp,*/*;q=0.8'
+    )
+    html_headers['accept-encoding'] = 'gzip, deflate'
+    html_headers['cache-control'] = 'no-cache'
+    html_headers['pragma'] = 'no-cache'
+
+    statuses = []
+    previous_url = None
+    for url in warm_urls:
+        request_headers = html_headers.copy()
+        if previous_url:
+            request_headers['referer'] = previous_url
+        response = session.get(url, headers=request_headers, timeout=25, allow_redirects=True)
+        statuses.append(response.status_code)
+        if verbose:
+            print(
+                f'[COOKIES] prime status={response.status_code} '
+                f'cookies={len(session.cookies)} bytes={len(response.content)} url={response.url}',
+                flush=True,
+            )
+        if response.status_code in {401, 403, 429}:
+            raise requests.HTTPError(
+                f'NSE session warm-up blocked with HTTP {response.status_code}',
+                response=response,
+            )
+        response.raise_for_status()
+        previous_url = response.url
+        time.sleep(0.5)
+
+    saved = _write_session_cookies()
+    if verbose:
+        print(f'[COOKIES] Session warm-up complete; saved={saved}, statuses={statuses}.', flush=True)
+    return True
+
+
+def _refresh_nse_session(reason='manual refresh'):
+    """Best-effort refresh that never crashes the persistent Railway worker."""
+    print(f'[COOKIES] Refresh requested: {reason}', flush=True)
+    try:
+        session.cookies.clear()
+    except Exception:
+        pass
+
+    _install_configured_cookies()
+
+    try:
+        refreshed = autocookie.getCookies()
+        if refreshed:
+            _install_cookies('', refreshed)
+    except Exception as exc:
+        print(f'[COOKIES] autocookie refresh failed but worker will continue: {type(exc).__name__}: {exc}', flush=True)
+
+    try:
+        return _prime_nse_session(verbose=True)
+    except Exception as exc:
+        print(f'[COOKIES] NSE session prime failed: {type(exc).__name__}: {exc}', flush=True)
+        return False
+
+
+def _bootstrap_cookies():
+    """Load available cookies and warm the session without terminating startup."""
+    _install_configured_cookies()
+    try:
+        return _prime_nse_session(verbose=True)
+    except Exception as exc:
+        print(f'[COOKIES] Initial session prime failed: {type(exc).__name__}: {exc}', flush=True)
+        return _refresh_nse_session('startup fallback')
 
 
 # ============================== UTILS ==============================
@@ -1121,9 +1214,7 @@ def getIndexData(url, symbol):
                 if futdf.empty and optdf.empty:
                     if attempt < 3:
                         print('No option/futures rows received. Refreshing cookies/session and retrying...')
-                        autocookie.getCookies()
-                        header, dct = _read_cookies_file()
-                        _install_cookies(header, dct)
+                        _refresh_nse_session(f'empty NSE response for {symbol}, attempt {attempt}')
                         time.sleep(3 * attempt + random.uniform(0, 1))
                         continue
                     break
@@ -1178,12 +1269,7 @@ def getIndexData(url, symbol):
             except (requests.exceptions.RequestException, json.JSONDecodeError) as e:
                 print(f"[ERROR] Attempt {attempt} for {symbol} - {e}")
                 print('Refreshing cookies and retrying...')
-                autocookie.getCookies()
-                try:
-                    header, dct = _read_cookies_file()
-                    _install_cookies(header, dct)
-                except Exception:
-                    pass
+                _refresh_nse_session(f'{symbol} request failure, attempt {attempt}')
                 time.sleep(3 * attempt + random.uniform(0, 1))
 
             except Exception as e:
@@ -1213,6 +1299,8 @@ def market_is_open(now=None):
 
 def main():
     print('[READY] NIFTY cloud live worker started. Market window 09:14-15:50 IST.', flush=True)
+    session_ready = False
+
     while True:
         now = ist_now()
         if not market_is_open(now):
@@ -1221,11 +1309,32 @@ def main():
             time.sleep(30)
             continue
 
-        for symbol in symbols:
-            url = f'https://www.nseindia.com/api/quote-derivative?symbol={symbol}'
-            getIndexData(url, symbol)
+        if not session_ready:
+            session_ready = _bootstrap_cookies()
+            if not session_ready:
+                print('[WAIT] NSE session is not ready; retrying in 60 seconds without crashing.', flush=True)
+                time.sleep(60)
+                continue
 
-        run_cash_money_flow_cycle()
+        cycle_failed = False
+        for symbol in symbols:
+            try:
+                url = f'https://www.nseindia.com/api/quote-derivative?symbol={symbol}'
+                getIndexData(url, symbol)
+            except Exception as exc:
+                cycle_failed = True
+                session_ready = False
+                print(f'[ERROR] Unhandled live cycle error for {symbol}: {type(exc).__name__}: {exc}', flush=True)
+                _refresh_nse_session(f'unhandled {symbol} cycle error')
+
+        try:
+            run_cash_money_flow_cycle()
+        except Exception as exc:
+            print(f'[WARN] Cash money-flow cycle failed: {type(exc).__name__}: {exc}', flush=True)
+
+        if cycle_failed:
+            print('[WAIT] One or more NSE calls failed; session will be rebuilt on the next cycle.', flush=True)
+
         print(f'[SLEEP] Next {WAIT_SECONDS}-second cycle at {ist_now():%d-%b-%Y %H:%M:%S IST}', flush=True)
         time.sleep(max(1.0, WAIT_SECONDS - time.time() % WAIT_SECONDS))
 
