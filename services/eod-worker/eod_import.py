@@ -251,8 +251,8 @@ def nse_report_urls(day: str | date) -> List[Tuple[str, str, bool]]:
         (f"fao_participant_vol_{tok['ddmmyyyy']}.csv", f"https://nsearchives.nseindia.com/content/nsccl/fao_participant_vol_{tok['ddmmyyyy']}.csv", True),
         (f"fii_stats_{tok['dd-Mon-yyyy']}.xls", f"https://nsearchives.nseindia.com/content/fo/fii_stats_{tok['dd-Mon-yyyy']}.xls", False),
         (f"BhavCopy_NSE_FO_0_0_0_{tok['yyyymmdd']}_F_0000.csv.zip", f"https://nsearchives.nseindia.com/content/fo/BhavCopy_NSE_FO_0_0_0_{tok['yyyymmdd']}_F_0000.csv.zip", True),
-        (f"BhavCopy_NSE_CM_0_0_0_{tok['yyyymmdd']}_F_0000.csv.zip", f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{tok['yyyymmdd']}_F_0000.csv.zip", False),
-        (f"sec_bhavdata_full_{tok['ddmmyyyy']}.csv", f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{tok['ddmmyyyy']}.csv", False),
+        (f"BhavCopy_NSE_CM_0_0_0_{tok['yyyymmdd']}_F_0000.csv.zip", f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{tok['yyyymmdd']}_F_0000.csv.zip", True),
+        (f"sec_bhavdata_full_{tok['ddmmyyyy']}.csv", f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{tok['ddmmyyyy']}.csv", True),
     ]
 
 
@@ -1954,51 +1954,168 @@ def upsert_payload_results(conn, payload: Dict[str, Any], volume_spurts: Optiona
     cur.close()
 
 
-def process_payloads(conn, dates: Sequence[str], symbols: Sequence[str], dashboard_script: str, volume_by_date: Dict[str, List[Dict[str, Any]]], eod_dir: Optional[str] = None):
+def _validate_raw_payload(payload: Dict[str, Any], trade_date: str, symbol: str) -> List[str]:
+    """Return blocking reasons when a raw EOD payload is incomplete.
+
+    A neutral decision must never be stored merely because the raw builder could
+    not see one of its source datasets.
+    """
+    issues: List[str] = []
+    if not isinstance(payload, dict):
+        return ["builder did not return a dictionary"]
+
+    error = str(payload.get("error") or "").strip()
+    if error:
+        issues.append(f"builder error: {error}")
+
+    participants = payload.get("participants") or []
+    expiry = str(payload.get("expiry") or "").strip()
+    strike_rows = payload.get("strikeRows") or []
+    walls = payload.get("walls") or {}
+    futures = payload.get("futures") or {}
+    cash = payload.get("cash") or {}
+    cm_market = payload.get("cmMarket") or {}
+
+    if len(participants) < 3:
+        issues.append(f"participant rows={len(participants)}; expected FII/Prop/DII/Client data")
+    if not expiry:
+        issues.append("selected expiry is blank")
+    if not strike_rows and not (walls.get("resistance") or walls.get("support")):
+        issues.append("no NIFTY option strike/wall rows")
+    if not (futures.get("current") or futures.get("rows") or futures.get("summary")):
+        issues.append("no NIFTY futures result")
+    if not (cash.get("topRows") or cash.get("rows") or cash.get("summary")):
+        issues.append("no cash-delivery footprint")
+    if not (cm_market.get("summary") or cm_market.get("history")):
+        issues.append("no CM participation result")
+
+    payload_date = str(payload.get("date") or "")
+    payload_symbol = str(payload.get("symbol") or "").upper()
+    if payload_date and payload_date != str(trade_date):
+        issues.append(f"payload date {payload_date} does not match requested {trade_date}")
+    if payload_symbol and payload_symbol != str(symbol).upper():
+        issues.append(f"payload symbol {payload_symbol} does not match requested {symbol}")
+
+    return issues
+
+
+def _processed_result_counts(conn, trade_date: str, symbol: str) -> Dict[str, int]:
+    """Read compact result counts used for post-build verification."""
+    checks = {
+        "participants": ("nse_participant_bias_daily", "trade_date=%s", (trade_date,)),
+        "walls": ("nse_option_wall_daily", "trade_date=%s AND UPPER(symbol)=UPPER(%s)", (trade_date, symbol)),
+        "futures": ("nse_futures_build_up_daily", "trade_date=%s AND UPPER(symbol)=UPPER(%s)", (trade_date, symbol)),
+        "cash": ("nse_cash_delivery_footprint_daily", "trade_date=%s", (trade_date,)),
+        "cm": ("nse_cm_participation_regime_daily", "trade_date=%s", (trade_date,)),
+        "decision": ("nse_360_decision_daily", "trade_date=%s AND UPPER(symbol)=UPPER(%s)", (trade_date, symbol)),
+    }
+    out: Dict[str, int] = {}
+    cur = conn.cursor()
+    try:
+        for name, (table, where_sql, params) in checks.items():
+            cur.execute(f"SELECT count(*) FROM {table} WHERE {where_sql}", params)
+            out[name] = int(cur.fetchone()[0] or 0)
+    finally:
+        cur.close()
+    return out
+
+
+def process_payloads(conn, dates: Sequence[str], symbols: Sequence[str], dashboard_script: str, volume_by_date: Dict[str, List[Dict[str, Any]]], eod_dir: Optional[str] = None) -> bool:
     mod = load_dashboard_module(dashboard_script)
     if mod is None:
         raise RuntimeError(f"Could not load dashboard builder file from {dashboard_script}")
     if not hasattr(mod, "build_eod_participation_payload"):
         raise RuntimeError(f"Dashboard builder loaded but build_eod_participation_payload() is missing in {dashboard_script}")
-    # Important for --direct temporary staging mode: the dashboard builder still
-    # contains the proven file-parsing logic for the final JSON payload. Point it
-    # to the staging folder for this run so it can parse the just-downloaded files
-    # and then store the final result in PostgreSQL cache.
+
+    # Point the proven raw/file builder at the just-downloaded reports.
     if eod_dir and hasattr(mod, "EOD_REPORTS_DIR"):
         mod.EOD_REPORTS_DIR = eod_dir
-    # V11.2 fix: importer must build payload from the just-downloaded files,
-    # not read stale/blank rows already present in nse_eod_payload_cache.
     if hasattr(mod, "ALLOW_EOD_FILE_FALLBACK"):
         mod.ALLOW_EOD_FILE_FALLBACK = True
-    if hasattr(mod, "read_eod_cached_payload"):
-        mod.read_eod_cached_payload = lambda *a, **k: None
+
+    # Critical cloud fix:
+    # The dashboard file ends with a wrapper that first reads processed result
+    # tables. During an importer run those tables are empty (or contain a prior
+    # fallback row), so the wrapper returned a blank Neutral payload and never
+    # reached the raw builder. Disable every processed/cache short-circuit while
+    # the importer is generating those very tables.
+    for name in (
+        "read_eod_cached_payload",
+        "read_eod_cached_payload_safe",
+        "build_eod_participation_payload_from_db",
+        "build_eod_participation_payload_from_results_fast",
+    ):
+        if hasattr(mod, name):
+            setattr(mod, name, lambda *a, **k: None)
+
+    # The cloud dashboard stores the proven raw builder in this alias before its
+    # later cache-first viewer overrides. Prefer it when available.
+    builder = getattr(mod, "_cloud_file_eod_builder", None)
+    if not callable(builder):
+        builder = mod.build_eod_participation_payload
+
     total_jobs = len(sorted(dates)) * len(symbols)
     job_no = 0
+    all_ok = True
     print(f"\nStarting processed EOD result-table build: {total_jobs} date/symbol jobs ...", flush=True)
     for d in sorted(dates):
         for symbol in symbols:
             job_no += 1
             try:
                 print(f"Result build: {job_no}/{total_jobs} {d} {symbol} ...", flush=True)
-                payload = mod.build_eod_participation_payload(symbol, trade_date=d, expiry=None)
+                payload = builder(symbol, trade_date=d, expiry=None)
+                issues = _validate_raw_payload(payload, d, symbol)
+                if issues:
+                    all_ok = False
+                    print(
+                        f"Result build: {d} {symbol}: INCOMPLETE - "
+                        + " | ".join(issues)
+                        + ". Processed rows/cache were not updated.",
+                        flush=True,
+                    )
+                    continue
+
                 spurts = volume_by_date.get(str(pd.to_datetime(d).date()), [])
                 upsert_payload_results(conn, payload, volume_spurts=spurts)
+
+                counts = _processed_result_counts(conn, d, symbol)
+                required_counts = (
+                    counts.get("participants", 0) >= 3
+                    and counts.get("walls", 0) > 0
+                    and counts.get("futures", 0) > 0
+                    and counts.get("cash", 0) > 0
+                    and counts.get("cm", 0) > 0
+                    and counts.get("decision", 0) > 0
+                )
+                cur = conn.cursor()
                 try:
-                    cur = conn.cursor()
                     cur.execute(
-                        "SELECT count(*), max(expiry_date) FROM nse_360_decision_daily WHERE trade_date=%s AND symbol=%s",
+                        "SELECT max(expiry_date) FROM nse_360_decision_daily "
+                        "WHERE trade_date=%s AND UPPER(symbol)=UPPER(%s)",
                         (d, symbol),
                     )
-                    cnt, max_exp = cur.fetchone()
+                    max_exp = cur.fetchone()[0]
+                finally:
                     cur.close()
-                    if int(cnt or 0) == 0:
-                        print(f"Result build: {d} {symbol}: WARNING no nse_360_decision_daily row inserted. This usually means builder payload lacks decision/view360/participants. Payload keys={list((payload or {}).keys())[:12]} error={(payload or {}).get('error')}", flush=True)
-                    else:
-                        print(f"Result build: {d} {symbol}: done; decision rows={cnt}, latest expiry={max_exp}", flush=True)
-                except Exception as verify_exc:
-                    print(f"Result build: {d} {symbol}: done; verification failed {type(verify_exc).__name__}: {verify_exc}", flush=True)
+
+                if not required_counts or not str(max_exp or "").strip():
+                    all_ok = False
+                    print(
+                        f"Result build: {d} {symbol}: verification FAILED "
+                        f"counts={counts}, latest expiry={max_exp!r}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"Result build: {d} {symbol}: SUCCESS "
+                        f"counts={counts}, latest expiry={max_exp}",
+                        flush=True,
+                    )
             except Exception as exc:
+                all_ok = False
                 print(f"Result build: {d} {symbol}: ERROR {type(exc).__name__}: {exc}", flush=True)
+
+    return all_ok
 
 
 # -------------------- MAIN --------------------
@@ -2157,13 +2274,26 @@ def main() -> int:
             for d, rows in volume_by_date.items():
                 print(f"{d}: volume spurt rows stored: {len(rows)}", flush=True)
 
+        result_build_ok = True
         if args.skip_payload_cache:
             print("\nProcessed EOD result-table build skipped.", flush=True)
         else:
-            # Build daily dashboards/results from the same logic already used in your dashboard.
-            process_payloads(conn, dates, symbols, dashboard_script, volume_by_date, eod_dir=eod_dir)
+            # Build processed rows only from raw EOD inputs. A partial Neutral
+            # fallback is treated as failure so the Railway runner can retry.
+            result_build_ok = process_payloads(
+                conn, dates, symbols, dashboard_script, volume_by_date, eod_dir=eod_dir
+            )
 
-        print("\nDone. Raw EOD data, compact processed EOD result tables, and cache are in PostgreSQL. RAW builder was forced and decision-row insertion was verified.", flush=True)
+        if not result_build_ok:
+            print(
+                "\nEOD processing is incomplete. Raw rows may be present, but the "
+                "processed EOD result/cache was not published. Returning code 2 so "
+                "the Railway runner can retry.",
+                flush=True,
+            )
+            return 2
+
+        print("\nDone. Raw EOD data, compact processed EOD result tables, and cache are in PostgreSQL. Full result validation passed.", flush=True)
         return 0
     finally:
         try:
