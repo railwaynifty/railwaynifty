@@ -10,7 +10,7 @@ PostgreSQL table names/column names consumed by the NSE360 backend/frontend.
 
 Writes
 ------
-options."NIFTY"     Current-week + next-week option-chain snapshots.
+options."NIFTY"     First N active option-expiry snapshots (default: 2).
 futures."NIFTY"     Nearest NIFTY futures snapshot.
 cash.*               NIFTY 50 cash-basket proxy tables used by 360 Money Flow.
 
@@ -22,11 +22,16 @@ UPSTOX_ANALYTICS_TOKEN
 Optional environment variables
 ------------------------------
 UPSTOX_UNDERLYING_KEY=NSE_INDEX|Nifty 50
-UPSTOX_OPTION_EXPIRIES=current_week,next_week
+UPSTOX_OPTION_EXPIRY_COUNT=2
 UPSTOX_WAIT_SECONDS=60
 UPSTOX_REQUEST_TIMEOUT=30
 UPSTOX_RUN_OUTSIDE_MARKET=0
 UPSTOX_DISABLE_CASH_MONEY_FLOW=0
+OPTION_HISTORY_DAYS=1
+FUTURES_HISTORY_DAYS=5
+CASH_HISTORY_DAYS=5
+DB_STORAGE_GUARD_MB=350
+DB_STORAGE_CHECK_MINUTES=15
 NIFTY50_CONSTITUENTS_URL=https://niftyindices.com/IndexConstituent/ind_nifty50list.csv
 APP_DATA_DIR=/app/data
 SCHEMA_OPTIONS=options
@@ -42,7 +47,7 @@ import math
 import os
 import sys
 import time
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
@@ -50,7 +55,8 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import requests
 import sqlalchemy
-from sqlalchemy import inspect, text
+from sqlalchemy import MetaData, Table, inspect, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from cloud_db import make_schema_engine
 import cash_money_flow as cash
@@ -64,11 +70,7 @@ APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 TOKEN = os.getenv("UPSTOX_ANALYTICS_TOKEN", "").strip()
 UNDERLYING_KEY = os.getenv("UPSTOX_UNDERLYING_KEY", "NSE_INDEX|Nifty 50").strip()
-OPTION_EXPIRIES = tuple(
-    value.strip()
-    for value in os.getenv("UPSTOX_OPTION_EXPIRIES", "current_week,next_week").split(",")
-    if value.strip()
-)
+OPTION_EXPIRY_COUNT = max(1, min(6, int(os.getenv("UPSTOX_OPTION_EXPIRY_COUNT", "2"))))
 WAIT_SECONDS = max(15, int(os.getenv("UPSTOX_WAIT_SECONDS", "60")))
 REQUEST_TIMEOUT = max(5, int(os.getenv("UPSTOX_REQUEST_TIMEOUT", "30")))
 MARKET_START = dtime(9, 14)
@@ -79,6 +81,11 @@ RUN_OUTSIDE_MARKET = os.getenv("UPSTOX_RUN_OUTSIDE_MARKET", "0").strip().lower()
 ENABLE_CASH = os.getenv("UPSTOX_DISABLE_CASH_MONEY_FLOW", "0").strip().lower() not in {
     "1", "true", "yes", "y"
 }
+OPTION_HISTORY_DAYS = max(1, int(os.getenv("OPTION_HISTORY_DAYS", "1")))
+FUTURES_HISTORY_DAYS = max(1, int(os.getenv("FUTURES_HISTORY_DAYS", "5")))
+CASH_HISTORY_DAYS = max(1, int(os.getenv("CASH_HISTORY_DAYS", "5")))
+DB_STORAGE_GUARD_MB = max(0, int(os.getenv("DB_STORAGE_GUARD_MB", "350")))
+DB_STORAGE_CHECK_MINUTES = max(1, int(os.getenv("DB_STORAGE_CHECK_MINUTES", "15")))
 CONSTITUENTS_URL = os.getenv(
     "NIFTY50_CONSTITUENTS_URL",
     "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv",
@@ -102,7 +109,10 @@ _FUTURE_ENGINE: Optional[sqlalchemy.Engine] = None
 _CASH_ENGINE: Optional[sqlalchemy.Engine] = None
 _OPTION_BUYING_AI_MODULE = None
 _FUTURE_CONTRACT_CACHE: Dict[str, Any] = {}
+_OPTION_EXPIRY_CACHE: Dict[str, Any] = {}
 _CONSTITUENT_CACHE: Dict[str, Any] = {}
+_LAST_RETENTION_DATE: Optional[str] = None
+_LAST_STORAGE_CHECK_MONOTONIC = 0.0
 
 
 # -------------------- GENERAL HELPERS --------------------
@@ -110,8 +120,12 @@ def now_ist() -> datetime:
     return datetime.now(IST)
 
 
+def minute_bucket(value: Optional[datetime] = None) -> datetime:
+    return (value or now_ist()).replace(second=0, microsecond=0)
+
+
 def snapshot_timestamp(value: Optional[datetime] = None) -> str:
-    return (value or now_ist()).strftime("%d-%b-%Y %H:%M:%S")
+    return minute_bucket(value).strftime("%d-%b-%Y %H:%M:%S")
 
 
 def safe_number(value: Any) -> Optional[float]:
@@ -188,14 +202,57 @@ def upstox_get(path: str, params: Optional[Dict[str, Any]] = None) -> Dict[str, 
     return payload
 
 
-def fetch_option_chain(expiry_selector: str) -> List[Dict[str, Any]]:
+def fetch_option_contracts() -> List[Dict[str, Any]]:
     payload = upstox_get(
-        "/v2/option/chain",
-        {"instrument_key": UNDERLYING_KEY, "expiry_date": expiry_selector},
+        "/v2/option/contract",
+        {"instrument_key": UNDERLYING_KEY},
     )
     rows = payload.get("data") or []
     if not isinstance(rows, list):
-        raise RuntimeError(f"Unexpected option-chain response for {expiry_selector}: {type(rows).__name__}")
+        raise RuntimeError(f"Unexpected option-contract response: {type(rows).__name__}")
+    return rows
+
+
+def discover_upcoming_option_expiries(force: bool = False) -> List[str]:
+    today = now_ist().date()
+    cached_date = _OPTION_EXPIRY_CACHE.get("date")
+    cached_expiries = _OPTION_EXPIRY_CACHE.get("expiries")
+    if cached_date == today.isoformat() and cached_expiries and not force:
+        return list(cached_expiries)[:OPTION_EXPIRY_COUNT]
+
+    contracts = fetch_option_contracts()
+    expiries: set[str] = set()
+    for item in contracts:
+        if not isinstance(item, dict):
+            continue
+        expiry_raw = item.get("expiry")
+        if not expiry_raw:
+            continue
+        try:
+            expiry_date = pd.to_datetime(expiry_raw, errors="raise").date()
+        except Exception:
+            continue
+        if expiry_date >= today:
+            expiries.add(expiry_date.isoformat())
+
+    selected = sorted(expiries)[:OPTION_EXPIRY_COUNT]
+    if len(selected) < OPTION_EXPIRY_COUNT:
+        raise RuntimeError(
+            f"Upstox returned only {len(selected)} active NIFTY expiries; "
+            f"requested {OPTION_EXPIRY_COUNT}. Available={sorted(expiries)}"
+        )
+    _OPTION_EXPIRY_CACHE.update({"date": today.isoformat(), "expiries": sorted(expiries)})
+    return selected
+
+
+def fetch_option_chain(expiry_date: str) -> List[Dict[str, Any]]:
+    payload = upstox_get(
+        "/v2/option/chain",
+        {"instrument_key": UNDERLYING_KEY, "expiry_date": expiry_date},
+    )
+    rows = payload.get("data") or []
+    if not isinstance(rows, list):
+        raise RuntimeError(f"Unexpected option-chain response for {expiry_date}: {type(rows).__name__}")
     return rows
 
 
@@ -503,35 +560,183 @@ def align_frame_to_existing_table(
     return out[existing]
 
 
-def replace_option_snapshot(engine: sqlalchemy.Engine, frame: pd.DataFrame) -> int:
+def _records_for_sql(frame: pd.DataFrame) -> List[Dict[str, Any]]:
+    clean = frame.astype(object).where(pd.notna(frame), None)
+    return clean.to_dict(orient="records")
+
+
+def _ensure_unique_index(
+    conn: sqlalchemy.Connection,
+    table_name: str,
+    index_name: str,
+    key_columns: Sequence[str],
+) -> None:
+    existing_indexes = {item.get("name") for item in inspect(conn).get_indexes(table_name)}
+    if index_name in existing_indexes:
+        return
+
+    quoted_columns = ", ".join(f'"{column}"' for column in key_columns)
+    # Fresh cloud databases have no duplicates. On an existing database, remove
+    # any exact duplicate natural keys once, before creating the unique index.
+    equality = " AND ".join(f'a."{column}" IS NOT DISTINCT FROM b."{column}"' for column in key_columns)
+    conn.execute(
+        text(
+            f'DELETE FROM "{table_name}" a USING "{table_name}" b '
+            f'WHERE a.ctid < b.ctid AND {equality}'
+        )
+    )
+    conn.execute(
+        text(
+            f'CREATE UNIQUE INDEX IF NOT EXISTS "{index_name}" '
+            f'ON "{table_name}" ({quoted_columns})'
+        )
+    )
+
+
+def upsert_frame(
+    engine: sqlalchemy.Engine,
+    frame: pd.DataFrame,
+    table_name: str,
+    key_columns: Sequence[str],
+    index_name: str,
+) -> int:
     if frame.empty:
         return 0
-    ts_values = sorted({str(value) for value in frame["timestamp"].dropna().tolist()})
-    expiry_values = sorted({str(value) for value in frame["expiryDate"].dropna().tolist()})
+    frame = frame.drop_duplicates(subset=list(key_columns), keep="last").copy()
     with engine.begin() as conn:
         inspector = inspect(conn)
-        if inspector.has_table(SYMBOL):
-            stmt = text(
-                f'DELETE FROM "{SYMBOL}" WHERE "timestamp" = :ts AND "expiryDate" = :expiry'
+        if not inspector.has_table(table_name):
+            frame.to_sql(table_name, con=conn, if_exists="append", index=False, method="multi", chunksize=1000)
+        ready = align_frame_to_existing_table(conn, frame, table_name)
+        _ensure_unique_index(conn, table_name, index_name, key_columns)
+        table = Table(table_name, MetaData(), autoload_with=conn)
+        records = _records_for_sql(ready)
+        if records:
+            stmt = pg_insert(table).values(records)
+            update_values = {
+                column.name: stmt.excluded[column.name]
+                for column in table.columns
+                if column.name not in key_columns
+            }
+            conn.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=[table.c[column] for column in key_columns],
+                    set_=update_values,
+                )
             )
-            for ts_value in ts_values:
-                for expiry_value in expiry_values:
-                    conn.execute(stmt, {"ts": ts_value, "expiry": expiry_value})
-        ready = align_frame_to_existing_table(conn, frame, SYMBOL)
-        ready.to_sql(SYMBOL, con=conn, if_exists="append", index=False, method="multi", chunksize=1000)
     return len(frame)
+
+
+def replace_option_snapshot(engine: sqlalchemy.Engine, frame: pd.DataFrame) -> int:
+    return upsert_frame(
+        engine,
+        frame,
+        SYMBOL,
+        ("timestamp", "expiryDate", "strikePrice", "optionType"),
+        "uq_nifty_minute_expiry_strike_side",
+    )
 
 
 def replace_future_snapshot(engine: sqlalchemy.Engine, frame: pd.DataFrame) -> int:
-    if frame.empty:
+    return upsert_frame(
+        engine,
+        frame,
+        SYMBOL,
+        ("timestamp", "expiryDate"),
+        "uq_nifty_future_minute_expiry",
+    )
+
+
+def database_size_mb(engine: sqlalchemy.Engine) -> float:
+    with engine.connect() as conn:
+        value = conn.execute(
+            text("SELECT pg_database_size(current_database()) / 1024.0 / 1024.0")
+        ).scalar()
+    return float(value or 0.0)
+
+
+def delete_old_timestamp_rows(
+    engine: sqlalchemy.Engine,
+    table_name: str,
+    retention_days: int,
+) -> int:
+    if not table_exists(engine, table_name):
         return 0
-    ts_value = str(frame.iloc[0]["timestamp"])
+    cutoff = now_ist().date() - timedelta(days=max(0, retention_days - 1))
     with engine.begin() as conn:
-        if inspect(conn).has_table(SYMBOL):
-            conn.execute(text(f'DELETE FROM "{SYMBOL}" WHERE "timestamp" = :ts'), {"ts": ts_value})
-        ready = align_frame_to_existing_table(conn, frame, SYMBOL)
-        ready.to_sql(SYMBOL, con=conn, if_exists="append", index=False, method="multi")
-    return len(frame)
+        result = conn.execute(
+            text(
+                f'DELETE FROM "{table_name}" '
+                'WHERE CAST("timestamp" AS TIMESTAMP)::date < :cutoff'
+            ),
+            {"cutoff": cutoff},
+        )
+    return int(result.rowcount or 0)
+
+
+def cleanup_cash_history(engine: sqlalchemy.Engine, retention_days: int) -> int:
+    cutoff = now_ist().date() - timedelta(days=max(0, retention_days - 1))
+    deleted = 0
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table_name in inspector.get_table_names():
+            if not table_name.startswith("nifty50_"):
+                continue
+            columns = {column["name"] for column in inspector.get_columns(table_name)}
+            try:
+                if "trade_date" in columns:
+                    result = conn.execute(
+                        text(f'DELETE FROM "{table_name}" WHERE CAST("trade_date" AS date) < :cutoff'),
+                        {"cutoff": cutoff},
+                    )
+                elif "timestamp" in columns:
+                    result = conn.execute(
+                        text(
+                            f'DELETE FROM "{table_name}" '
+                            'WHERE CAST("timestamp" AS TIMESTAMP)::date < :cutoff'
+                        ),
+                        {"cutoff": cutoff},
+                    )
+                else:
+                    continue
+                deleted += int(result.rowcount or 0)
+            except Exception as exc:
+                print(f"[RETENTION] cash table {table_name} warning: {type(exc).__name__}: {exc}")
+    return deleted
+
+
+def run_retention_cleanup(force: bool = False) -> None:
+    global _LAST_RETENTION_DATE, _LAST_STORAGE_CHECK_MONOTONIC
+    today_key = now_ist().date().isoformat()
+    elapsed = time.monotonic() - _LAST_STORAGE_CHECK_MONOTONIC
+    periodic_due = elapsed >= DB_STORAGE_CHECK_MINUTES * 60
+    daily_due = _LAST_RETENTION_DATE != today_key
+    if not force and not periodic_due and not daily_due:
+        return
+
+    option_deleted = delete_old_timestamp_rows(option_engine(), SYMBOL, OPTION_HISTORY_DAYS)
+    future_deleted = delete_old_timestamp_rows(future_engine(), SYMBOL, FUTURES_HISTORY_DAYS)
+    cash_deleted = 0
+    if ENABLE_CASH:
+        try:
+            cash_deleted = cleanup_cash_history(cash_engine(), CASH_HISTORY_DAYS)
+        except Exception as exc:
+            print(f"[RETENTION] cash cleanup warning: {type(exc).__name__}: {exc}")
+
+    size_mb = database_size_mb(option_engine())
+    guard_text = "disabled" if DB_STORAGE_GUARD_MB <= 0 else f"{DB_STORAGE_GUARD_MB} MB"
+    print(
+        f"[RETENTION] options_deleted={option_deleted} futures_deleted={future_deleted} "
+        f"cash_deleted={cash_deleted} database_size={size_mb:.1f} MB guard={guard_text}"
+    )
+    if DB_STORAGE_GUARD_MB > 0 and size_mb >= DB_STORAGE_GUARD_MB:
+        print(
+            f"[STORAGE] WARNING database size is {size_mb:.1f} MB, above guard "
+            f"{DB_STORAGE_GUARD_MB} MB. Current-day option history is retained; "
+            "upgrade storage or archive/export before the volume becomes full."
+        )
+    _LAST_RETENTION_DATE = today_key
+    _LAST_STORAGE_CHECK_MONOTONIC = time.monotonic()
 
 
 # -------------------- CASH MONEY FLOW --------------------
@@ -733,19 +938,23 @@ def refresh_option_buying_ai_cache(trade_date: str, expiry: Optional[str]) -> No
 
 # -------------------- CYCLE --------------------
 def run_cycle() -> Dict[str, Any]:
-    cycle_time = now_ist()
+    cycle_time = minute_bucket(now_ist())
     ts = snapshot_timestamp(cycle_time)
     trade_date = cycle_time.date().isoformat()
     print(f"[RUN] Upstox NIFTY cycle @ {ts}")
 
+    run_retention_cleanup()
+    selected_expiries = discover_upcoming_option_expiries()
+    print(f"[OPTIONS] selected expiries={selected_expiries}")
+
     chains: List[List[Dict[str, Any]]] = []
     actual_expiries: List[str] = []
-    for selector in OPTION_EXPIRIES:
-        chain = fetch_option_chain(selector)
+    for expiry_date in selected_expiries:
+        chain = fetch_option_chain(expiry_date)
         chains.append(chain)
         chain_expiries = sorted({str(item.get("expiry")) for item in chain if item.get("expiry")})
-        actual_expiries.extend(chain_expiries)
-        print(f"[OPTIONS] selector={selector} strikes={len(chain)} expiries={chain_expiries}")
+        actual_expiries.extend(chain_expiries or [expiry_date])
+        print(f"[OPTIONS] expiry={expiry_date} strikes={len(chain)} response_expiries={chain_expiries}")
 
     options_df = build_options_dataframe(chains, ts)
     if options_df.empty:
@@ -787,10 +996,14 @@ def run_cycle() -> Dict[str, Any]:
 
 
 def startup_token_test() -> None:
-    print("[UPSTOX] Validating Analytics Token and NIFTY option-chain access...")
-    chain = fetch_option_chain(OPTION_EXPIRIES[0] if OPTION_EXPIRIES else "current_week")
+    print("[UPSTOX] Validating Analytics Token and active NIFTY option expiries...")
+    selected = discover_upcoming_option_expiries(force=True)
+    chain = fetch_option_chain(selected[0])
     expiries = sorted({str(item.get("expiry")) for item in chain if item.get("expiry")})
-    print(f"[UPSTOX] Token valid. Option-chain strikes={len(chain)} expiries={expiries}")
+    print(
+        f"[UPSTOX] Token valid. selected_expiries={selected} "
+        f"first_chain_strikes={len(chain)} response_expiries={expiries}"
+    )
 
 
 def main() -> int:
@@ -805,10 +1018,12 @@ def main() -> int:
     future_engine()
     if ENABLE_CASH:
         cash_engine()
+    run_retention_cleanup(force=True)
 
     print(
         f"[READY] NSE360 Upstox worker started. source=UPSTOX_ANALYTICS "
-        f"underlying={UNDERLYING_KEY} expiries={OPTION_EXPIRIES} "
+        f"underlying={UNDERLYING_KEY} expiry_count={OPTION_EXPIRY_COUNT} "
+        f"option_history_days={OPTION_HISTORY_DAYS} futures_history_days={FUTURES_HISTORY_DAYS} "
         f"market={MARKET_START.strftime('%H:%M')}-{MARKET_END.strftime('%H:%M')} IST"
     )
     startup_token_test()
