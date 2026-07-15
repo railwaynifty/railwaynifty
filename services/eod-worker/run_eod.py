@@ -3,16 +3,122 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
-import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+from cloud_db import psycopg_connect
 
 
 IST = ZoneInfo("Asia/Kolkata")
 
 
-def _run_once(here: Path, trade_date: str, data_dir: Path, eod_dir: Path, attempt: int, max_attempts: int) -> int:
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw in {"1", "true", "yes", "y", "on"}
+
+
+def table_exists(cur, qualified_name: str) -> bool:
+    cur.execute("SELECT to_regclass(%s)", (qualified_name,))
+    return cur.fetchone()[0] is not None
+
+
+def truncate_if_exists(cur, table_names: list[str]) -> list[str]:
+    existing = [name for name in table_names if table_exists(cur, name)]
+    if existing:
+        cur.execute("TRUNCATE TABLE " + ", ".join(existing))
+    return existing
+
+
+def purge_eod_raw_storage(trade_date: str) -> None:
+    """
+    Preserve compact processed EOD tables but remove bulky raw imports after a
+    successful result build. Keep the small participant history and the
+    NIFTY-50-only cash bhavcopy history used by the STD-200 scanner.
+    """
+    if not env_bool("EOD_STORAGE_SAFE_PURGE", True):
+        print("[EOD-STORAGE] Raw-data purge disabled by EOD_STORAGE_SAFE_PURGE=0", flush=True)
+        return
+
+    participant_days = max(5, int(os.getenv("EOD_PARTICIPANT_RAW_DAYS", "15")))
+    cash_calendar_days = max(250, int(os.getenv("EOD_CASH_HISTORY_CALENDAR_DAYS", "450")))
+    registry_days = max(7, int(os.getenv("EOD_FILE_REGISTRY_DAYS", "30")))
+
+    conn = psycopg_connect("idxoptionsdata_current", autocommit=False)
+    try:
+        with conn.cursor() as cur:
+            truncated = truncate_if_exists(
+                cur,
+                [
+                    "nse_fo_bhavcopy_raw",
+                    "nse_cm_bhavcopy_raw",
+                    "nse_sec_bhavdata_raw",
+                    "nse_fii_stats_raw",
+                ],
+            )
+
+            participant_deleted = 0
+            for table_name in ("nse_participant_oi_raw", "nse_participant_vol_raw"):
+                if table_exists(cur, table_name):
+                    cur.execute(
+                        f"DELETE FROM {table_name} "
+                        "WHERE trade_date < (CURRENT_DATE - %s::integer)",
+                        (participant_days,),
+                    )
+                    participant_deleted += int(cur.rowcount or 0)
+
+            registry_deleted = 0
+            if table_exists(cur, "nse_eod_file_registry"):
+                cur.execute(
+                    "DELETE FROM nse_eod_file_registry "
+                    "WHERE trade_date < (CURRENT_DATE - %s::integer)",
+                    (registry_days,),
+                )
+                registry_deleted = int(cur.rowcount or 0)
+
+            cash_deleted = 0
+            cash_mode = "date-only"
+            if table_exists(cur, "nse_bhavcopy_eod"):
+                # Prefer the live-worker's current NIFTY 50 constituent table.
+                # This keeps about 50 x 200 sessions instead of the full market.
+                if table_exists(cur, "cash.nifty50_cash_constituents"):
+                    cur.execute(
+                        "DELETE FROM nse_bhavcopy_eod b "
+                        "WHERE NOT EXISTS ("
+                        "  SELECT 1 FROM cash.nifty50_cash_constituents c "
+                        "  WHERE UPPER(c.symbol) = UPPER(b.symbol)"
+                        ")"
+                    )
+                    cash_deleted += int(cur.rowcount or 0)
+                    cash_mode = "NIFTY50-only"
+                cur.execute(
+                    "DELETE FROM nse_bhavcopy_eod "
+                    "WHERE trade_date < (CURRENT_DATE - %s::integer)",
+                    (cash_calendar_days,),
+                )
+                cash_deleted += int(cur.rowcount or 0)
+
+        conn.commit()
+        print(
+            f"[EOD-STORAGE] success date={trade_date} truncated={truncated} "
+            f"participant_deleted={participant_deleted} registry_deleted={registry_deleted} "
+            f"cash_deleted={cash_deleted} cash_mode={cash_mode}",
+            flush=True,
+        )
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+def main() -> int:
+    here = Path(__file__).resolve().parent
+    data_dir = Path(os.getenv("APP_DATA_DIR", str(here / "data")))
+    eod_dir = data_dir / "nse_eod_reports"
+    eod_dir.mkdir(parents=True, exist_ok=True)
+    trade_date = datetime.now(IST).date().isoformat()
+
     command = [
         sys.executable,
         str(here / "eod_import.py"),
@@ -24,58 +130,24 @@ def _run_once(here: Path, trade_date: str, data_dir: Path, eod_dir: Path, attemp
         "--dashboard-script", str(here / "dashboard.py"),
         "--non-interactive",
         "--no-install-deps",
-        "--force",
     ]
-    print(
-        f"[EOD] Attempt {attempt}/{max_attempts}: processing {trade_date} "
-        f"at {datetime.now(IST):%d-%b-%Y %H:%M:%S IST}",
-        flush=True,
-    )
+    print(f"[EOD] Running automatic NSE EOD processing for {trade_date} at 20:00 IST", flush=True)
     completed = subprocess.run(command, check=False)
-    print(f"[EOD] Attempt {attempt}/{max_attempts} returned code {completed.returncode}.", flush=True)
-    return int(completed.returncode)
+    if completed.returncode != 0:
+        print(
+            f"[EOD] Import returned code {completed.returncode}. On NSE holidays this can mean "
+            "reports were not published. Raw tables were not purged.",
+            flush=True,
+        )
+        return completed.returncode
 
-
-def main() -> int:
-    here = Path(__file__).resolve().parent
-    data_dir = Path(os.getenv("APP_DATA_DIR", str(here / "data")))
-    eod_dir = data_dir / "nse_eod_reports"
-    eod_dir.mkdir(parents=True, exist_ok=True)
-
-    trade_date = os.getenv("EOD_TRADE_DATE", "").strip() or datetime.now(IST).date().isoformat()
-    retry_minutes = max(1, int(os.getenv("EOD_RETRY_MINUTES", "15")))
-    max_attempts = max(1, int(os.getenv("EOD_MAX_ATTEMPTS", "5")))
-
-    print(
-        f"[EOD] Automatic NSE EOD processing started for {trade_date}. "
-        f"Maximum attempts={max_attempts}, retry interval={retry_minutes} minutes.",
-        flush=True,
-    )
-
-    last_code = 1
-    for attempt in range(1, max_attempts + 1):
-        last_code = _run_once(here, trade_date, data_dir, eod_dir, attempt, max_attempts)
-        if last_code == 0:
-            print(f"[EOD] Full EOD processing completed successfully for {trade_date}.", flush=True)
-            return 0
-
-        if attempt < max_attempts:
-            wait_seconds = retry_minutes * 60
-            next_run = datetime.now(IST).timestamp() + wait_seconds
-            next_label = datetime.fromtimestamp(next_run, IST).strftime("%H:%M:%S IST")
-            print(
-                f"[EOD] Processing incomplete. Retrying in {retry_minutes} minutes "
-                f"(around {next_label}).",
-                flush=True,
-            )
-            time.sleep(wait_seconds)
-
-    print(
-        f"[EOD] All {max_attempts} attempts failed for {trade_date}. "
-        "On an NSE holiday this is expected; otherwise inspect the final import logs.",
-        flush=True,
-    )
-    return last_code or 2
+    try:
+        purge_eod_raw_storage(trade_date)
+    except Exception as exc:
+        # Processing succeeded, so preserve the EOD success status but make the
+        # cleanup failure prominent in Railway logs.
+        print(f"[EOD-STORAGE] WARNING purge failed: {type(exc).__name__}: {exc}", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

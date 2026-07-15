@@ -28,10 +28,14 @@ UPSTOX_REQUEST_TIMEOUT=30
 UPSTOX_RUN_OUTSIDE_MARKET=0
 UPSTOX_DISABLE_CASH_MONEY_FLOW=0
 OPTION_HISTORY_DAYS=1
+OPTION_HISTORY_ATM_STEPS=10
+OPTION_VACUUM_MINUTES=30
 FUTURES_HISTORY_DAYS=5
-CASH_HISTORY_DAYS=5
-DB_STORAGE_GUARD_MB=350
-DB_STORAGE_CHECK_MINUTES=15
+CASH_HISTORY_DAYS=3
+DB_STORAGE_WARN_MB=250
+DB_STORAGE_PURGE_MB=300
+DB_STORAGE_HARD_STOP_MB=340
+DB_STORAGE_CHECK_MINUTES=5
 NIFTY50_CONSTITUENTS_URL=https://niftyindices.com/IndexConstituent/ind_nifty50list.csv
 APP_DATA_DIR=/app/data
 SCHEMA_OPTIONS=options
@@ -82,10 +86,23 @@ ENABLE_CASH = os.getenv("UPSTOX_DISABLE_CASH_MONEY_FLOW", "0").strip().lower() n
     "1", "true", "yes", "y"
 }
 OPTION_HISTORY_DAYS = max(1, int(os.getenv("OPTION_HISTORY_DAYS", "1")))
+OPTION_HISTORY_ATM_STEPS = max(1, int(os.getenv("OPTION_HISTORY_ATM_STEPS", "10")))
+OPTION_VACUUM_MINUTES = max(5, int(os.getenv("OPTION_VACUUM_MINUTES", "30")))
 FUTURES_HISTORY_DAYS = max(1, int(os.getenv("FUTURES_HISTORY_DAYS", "5")))
-CASH_HISTORY_DAYS = max(1, int(os.getenv("CASH_HISTORY_DAYS", "5")))
-DB_STORAGE_GUARD_MB = max(0, int(os.getenv("DB_STORAGE_GUARD_MB", "350")))
-DB_STORAGE_CHECK_MINUTES = max(1, int(os.getenv("DB_STORAGE_CHECK_MINUTES", "15")))
+CASH_HISTORY_DAYS = max(1, int(os.getenv("CASH_HISTORY_DAYS", "3")))
+DB_STORAGE_WARN_MB = max(50, int(os.getenv("DB_STORAGE_WARN_MB", "250")))
+DB_STORAGE_PURGE_MB = max(
+    DB_STORAGE_WARN_MB + 10,
+    int(os.getenv("DB_STORAGE_PURGE_MB", "300")),
+)
+DB_STORAGE_HARD_STOP_MB = max(
+    DB_STORAGE_PURGE_MB + 10,
+    int(os.getenv("DB_STORAGE_HARD_STOP_MB", "340")),
+)
+DB_STORAGE_CHECK_MINUTES = max(1, int(os.getenv("DB_STORAGE_CHECK_MINUTES", "5")))
+# Kept only so old Railway variables do not cause confusion. The active safety
+# thresholds are WARN/PURGE/HARD_STOP above.
+LEGACY_DB_STORAGE_GUARD_MB = max(0, int(os.getenv("DB_STORAGE_GUARD_MB", "0")))
 CONSTITUENTS_URL = os.getenv(
     "NIFTY50_CONSTITUENTS_URL",
     "https://niftyindices.com/IndexConstituent/ind_nifty50list.csv",
@@ -113,6 +130,9 @@ _OPTION_EXPIRY_CACHE: Dict[str, Any] = {}
 _CONSTITUENT_CACHE: Dict[str, Any] = {}
 _LAST_RETENTION_DATE: Optional[str] = None
 _LAST_STORAGE_CHECK_MONOTONIC = 0.0
+_LAST_OPTION_VACUUM_MONOTONIC = 0.0
+_LAST_DATABASE_SIZE_MB = 0.0
+_STORAGE_WRITES_PAUSED = False
 
 
 # -------------------- GENERAL HELPERS --------------------
@@ -655,6 +675,60 @@ def database_size_mb(engine: sqlalchemy.Engine) -> float:
     return float(value or 0.0)
 
 
+def truncate_table(engine: sqlalchemy.Engine, table_name: str, reason: str) -> bool:
+    if not table_exists(engine, table_name):
+        return False
+    with engine.begin() as conn:
+        conn.execute(text(f'TRUNCATE TABLE "{table_name}"'))
+    print(f"[STORAGE] Truncated {table_name}: {reason}")
+    return True
+
+
+def table_date_counts(engine: sqlalchemy.Engine, table_name: str) -> Tuple[int, int]:
+    """Return (all rows, today's rows) for a text/timestamp-based table."""
+    if not table_exists(engine, table_name):
+        return 0, 0
+    today = now_ist().date()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                f'SELECT COUNT(*) AS total, '
+                f'COUNT(*) FILTER (WHERE CAST("timestamp" AS TIMESTAMP)::date = :today) AS today '
+                f'FROM "{table_name}"'
+            ),
+            {"today": today},
+        ).mappings().one()
+    return int(row["total"] or 0), int(row["today"] or 0)
+
+
+def daily_reset_option_history(engine: sqlalchemy.Engine) -> int:
+    """
+    Keep current-day option history only.
+
+    When a new trading day starts and the table contains no rows for today,
+    TRUNCATE is used instead of DELETE. TRUNCATE immediately releases the old
+    relation pages and is important on Railway's 500 MB volume.
+    """
+    if not table_exists(engine, SYMBOL):
+        return 0
+    total_rows, today_rows = table_date_counts(engine, SYMBOL)
+    if total_rows <= 0:
+        return 0
+    if today_rows == 0:
+        truncate_table(engine, SYMBOL, "new trading day; previous option history removed")
+        return total_rows
+
+    with engine.begin() as conn:
+        result = conn.execute(
+            text(
+                f'DELETE FROM "{SYMBOL}" '
+                'WHERE CAST("timestamp" AS TIMESTAMP)::date < :today'
+            ),
+            {"today": now_ist().date()},
+        )
+    return int(result.rowcount or 0)
+
+
 def delete_old_timestamp_rows(
     engine: sqlalchemy.Engine,
     table_name: str,
@@ -705,38 +779,185 @@ def cleanup_cash_history(engine: sqlalchemy.Engine, retention_days: int) -> int:
     return deleted
 
 
-def run_retention_cleanup(force: bool = False) -> None:
-    global _LAST_RETENTION_DATE, _LAST_STORAGE_CHECK_MONOTONIC
-    today_key = now_ist().date().isoformat()
-    elapsed = time.monotonic() - _LAST_STORAGE_CHECK_MONOTONIC
-    periodic_due = elapsed >= DB_STORAGE_CHECK_MINUTES * 60
-    daily_due = _LAST_RETENTION_DATE != today_key
-    if not force and not periodic_due and not daily_due:
-        return
+def infer_option_step(frame: pd.DataFrame) -> float:
+    strikes = sorted(
+        {
+            float(value)
+            for value in frame.get("strikePrice", pd.Series(dtype=float)).dropna().tolist()
+            if safe_number(value) is not None
+        }
+    )
+    positive_diffs = [
+        right - left
+        for left, right in zip(strikes, strikes[1:])
+        if right - left > 0
+    ]
+    if not positive_diffs:
+        return 50.0
+    return float(pd.Series(positive_diffs).median())
 
-    option_deleted = delete_old_timestamp_rows(option_engine(), SYMBOL, OPTION_HISTORY_DAYS)
-    future_deleted = delete_old_timestamp_rows(future_engine(), SYMBOL, FUTURES_HISTORY_DAYS)
-    cash_deleted = 0
-    if ENABLE_CASH:
-        try:
-            cash_deleted = cleanup_cash_history(cash_engine(), CASH_HISTORY_DAYS)
-        except Exception as exc:
-            print(f"[RETENTION] cash cleanup warning: {type(exc).__name__}: {exc}")
+
+def compact_previous_option_snapshot(
+    engine: sqlalchemy.Engine,
+    current_timestamp: str,
+    current_frame: pd.DataFrame,
+) -> int:
+    """
+    Keep the newest snapshot as the complete two-expiry chain so all current
+    dashboard OI-wall calculations remain accurate. Once a newer snapshot is
+    stored, compact only the immediately previous snapshot to ATM +/- N strikes.
+
+    This leaves current data complete while reducing historical growth from
+    roughly 396 rows/minute to about 84 rows/minute for two expiries at +/-10.
+    """
+    if current_frame.empty or not table_exists(engine, SYMBOL):
+        return 0
+    spots = [safe_number(value) for value in current_frame.get("spotPrice", pd.Series(dtype=float)).tolist()]
+    spots = [value for value in spots if value is not None and value > 0]
+    if not spots:
+        return 0
+    spot = float(spots[0])
+    step = infer_option_step(current_frame)
+    atm = round(spot / step) * step
+    low_strike = atm - (OPTION_HISTORY_ATM_STEPS * step)
+    high_strike = atm + (OPTION_HISTORY_ATM_STEPS * step)
+
+    with engine.begin() as conn:
+        previous_ts = conn.execute(
+            text(
+                f'SELECT "timestamp" FROM "{SYMBOL}" '
+                'WHERE CAST("timestamp" AS TIMESTAMP) < CAST(:current_ts AS TIMESTAMP) '
+                'AND CAST("timestamp" AS TIMESTAMP)::date = CAST(:current_ts AS TIMESTAMP)::date '
+                'ORDER BY CAST("timestamp" AS TIMESTAMP) DESC LIMIT 1'
+            ),
+            {"current_ts": current_timestamp},
+        ).scalar()
+        if not previous_ts:
+            return 0
+        result = conn.execute(
+            text(
+                f'DELETE FROM "{SYMBOL}" '
+                'WHERE "timestamp" = :previous_ts '
+                'AND (CAST("strikePrice" AS DOUBLE PRECISION) < :low_strike '
+                'OR CAST("strikePrice" AS DOUBLE PRECISION) > :high_strike)'
+            ),
+            {
+                "previous_ts": previous_ts,
+                "low_strike": low_strike,
+                "high_strike": high_strike,
+            },
+        )
+    deleted = int(result.rowcount or 0)
+    if deleted:
+        print(
+            f"[COMPACT] previous_ts={previous_ts} deleted={deleted} "
+            f"kept_range={low_strike:.0f}-{high_strike:.0f} "
+            f"ATM={atm:.0f} steps={OPTION_HISTORY_ATM_STEPS}"
+        )
+    return deleted
+
+
+def vacuum_option_table_if_due(engine: sqlalchemy.Engine, force: bool = False) -> None:
+    global _LAST_OPTION_VACUUM_MONOTONIC
+    if not table_exists(engine, SYMBOL):
+        return
+    elapsed = time.monotonic() - _LAST_OPTION_VACUUM_MONOTONIC
+    if not force and elapsed < OPTION_VACUUM_MINUTES * 60:
+        return
+    # VACUUM must run outside a transaction. It does not require extra rewrite
+    # space and makes dead tuples reusable; VACUUM FULL is intentionally avoided.
+    try:
+        with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            conn.execute(text(f'VACUUM (ANALYZE) "{SYMBOL}"'))
+        _LAST_OPTION_VACUUM_MONOTONIC = time.monotonic()
+        print(f"[VACUUM] options.{SYMBOL} analyzed; dead space is reusable")
+    except Exception as exc:
+        print(f"[VACUUM] warning: {type(exc).__name__}: {exc}")
+
+
+def emergency_option_reset(engine: sqlalchemy.Engine, size_before_mb: float) -> float:
+    """
+    Immediate pressure relief. DELETE does not reduce pg_database_size, whereas
+    TRUNCATE releases the option relation files immediately. The current cycle
+    then writes a fresh complete snapshot, so the dashboard continues working.
+    """
+    if table_exists(engine, SYMBOL):
+        truncate_table(
+            engine,
+            SYMBOL,
+            f"database {size_before_mb:.1f} MB reached purge threshold {DB_STORAGE_PURGE_MB} MB",
+        )
+    size_after = database_size_mb(engine)
+    print(
+        f"[STORAGE] emergency reset complete size_before={size_before_mb:.1f} MB "
+        f"size_after={size_after:.1f} MB"
+    )
+    return size_after
+
+
+def storage_guard_before_writes(force: bool = False) -> Tuple[bool, float]:
+    global _LAST_STORAGE_CHECK_MONOTONIC, _LAST_DATABASE_SIZE_MB, _STORAGE_WRITES_PAUSED
+    elapsed = time.monotonic() - _LAST_STORAGE_CHECK_MONOTONIC
+    if not force and elapsed < DB_STORAGE_CHECK_MINUTES * 60:
+        return (not _STORAGE_WRITES_PAUSED), _LAST_DATABASE_SIZE_MB
 
     size_mb = database_size_mb(option_engine())
-    guard_text = "disabled" if DB_STORAGE_GUARD_MB <= 0 else f"{DB_STORAGE_GUARD_MB} MB"
+    _LAST_STORAGE_CHECK_MONOTONIC = time.monotonic()
+    _LAST_DATABASE_SIZE_MB = size_mb
+
+    if size_mb >= DB_STORAGE_PURGE_MB:
+        size_mb = emergency_option_reset(option_engine(), size_mb)
+        _LAST_DATABASE_SIZE_MB = size_mb
+
+    if size_mb >= DB_STORAGE_HARD_STOP_MB:
+        _STORAGE_WRITES_PAUSED = True
+        print(
+            f"[STORAGE] CRITICAL database={size_mb:.1f} MB remains at/above hard-stop "
+            f"{DB_STORAGE_HARD_STOP_MB} MB after option reset. All market-data writes "
+            "are paused to protect PostgreSQL. Clear EOD/raw data or increase storage."
+        )
+        return False, size_mb
+
+    if _STORAGE_WRITES_PAUSED:
+        print(f"[STORAGE] RECOVERED database={size_mb:.1f} MB; writes resumed")
+    _STORAGE_WRITES_PAUSED = False
+    if size_mb >= DB_STORAGE_WARN_MB:
+        print(
+            f"[STORAGE] WARNING database={size_mb:.1f} MB warn={DB_STORAGE_WARN_MB} MB "
+            f"purge={DB_STORAGE_PURGE_MB} MB hard_stop={DB_STORAGE_HARD_STOP_MB} MB"
+        )
+    else:
+        print(
+            f"[STORAGE] database={size_mb:.1f} MB warn={DB_STORAGE_WARN_MB} MB "
+            f"purge={DB_STORAGE_PURGE_MB} MB hard_stop={DB_STORAGE_HARD_STOP_MB} MB"
+        )
+    return True, size_mb
+
+
+def run_retention_cleanup(force: bool = False) -> Tuple[bool, float]:
+    global _LAST_RETENTION_DATE
+    today_key = now_ist().date().isoformat()
+    daily_due = _LAST_RETENTION_DATE != today_key
+
+    option_deleted = 0
+    future_deleted = 0
+    cash_deleted = 0
+    if force or daily_due:
+        option_deleted = daily_reset_option_history(option_engine())
+        future_deleted = delete_old_timestamp_rows(future_engine(), SYMBOL, FUTURES_HISTORY_DAYS)
+        if ENABLE_CASH:
+            try:
+                cash_deleted = cleanup_cash_history(cash_engine(), CASH_HISTORY_DAYS)
+            except Exception as exc:
+                print(f"[RETENTION] cash cleanup warning: {type(exc).__name__}: {exc}")
+        _LAST_RETENTION_DATE = today_key
+
+    allowed, size_mb = storage_guard_before_writes(force=force)
     print(
         f"[RETENTION] options_deleted={option_deleted} futures_deleted={future_deleted} "
-        f"cash_deleted={cash_deleted} database_size={size_mb:.1f} MB guard={guard_text}"
+        f"cash_deleted={cash_deleted} database_size={size_mb:.1f} MB writes_allowed={allowed}"
     )
-    if DB_STORAGE_GUARD_MB > 0 and size_mb >= DB_STORAGE_GUARD_MB:
-        print(
-            f"[STORAGE] WARNING database size is {size_mb:.1f} MB, above guard "
-            f"{DB_STORAGE_GUARD_MB} MB. Current-day option history is retained; "
-            "upgrade storage or archive/export before the volume becomes full."
-        )
-    _LAST_RETENTION_DATE = today_key
-    _LAST_STORAGE_CHECK_MONOTONIC = time.monotonic()
+    return allowed, size_mb
 
 
 # -------------------- CASH MONEY FLOW --------------------
@@ -943,7 +1164,18 @@ def run_cycle() -> Dict[str, Any]:
     trade_date = cycle_time.date().isoformat()
     print(f"[RUN] Upstox NIFTY cycle @ {ts}")
 
-    run_retention_cleanup()
+    writes_allowed, _ = run_retention_cleanup()
+    if not writes_allowed:
+        return {
+            "timestamp": ts,
+            "trade_date": trade_date,
+            "option_rows": 0,
+            "future_rows": 0,
+            "expiries": [],
+            "cash": None,
+            "storage_paused": True,
+        }
+
     selected_expiries = discover_upcoming_option_expiries()
     print(f"[OPTIONS] selected expiries={selected_expiries}")
 
@@ -960,8 +1192,10 @@ def run_cycle() -> Dict[str, Any]:
     if options_df.empty:
         raise RuntimeError("Upstox option chain returned no CE/PE rows.")
     option_count = replace_option_snapshot(option_engine(), options_df)
+    compacted = compact_previous_option_snapshot(option_engine(), ts, options_df)
+    vacuum_option_table_if_due(option_engine())
     print(
-        f"[OPTIONS] stored={option_count} contracts "
+        f"[OPTIONS] stored={option_count} contracts compacted={compacted} "
         f"expiries={sorted(options_df['expiryDate'].astype(str).unique().tolist())}"
     )
 
@@ -1023,7 +1257,10 @@ def main() -> int:
     print(
         f"[READY] NSE360 Upstox worker started. source=UPSTOX_ANALYTICS "
         f"underlying={UNDERLYING_KEY} expiry_count={OPTION_EXPIRY_COUNT} "
-        f"option_history_days={OPTION_HISTORY_DAYS} futures_history_days={FUTURES_HISTORY_DAYS} "
+        f"option_history_days={OPTION_HISTORY_DAYS} history_atm_steps={OPTION_HISTORY_ATM_STEPS} "
+        f"futures_history_days={FUTURES_HISTORY_DAYS} cash_history_days={CASH_HISTORY_DAYS} "
+        f"storage_warn={DB_STORAGE_WARN_MB} storage_purge={DB_STORAGE_PURGE_MB} "
+        f"storage_hard_stop={DB_STORAGE_HARD_STOP_MB} "
         f"market={MARKET_START.strftime('%H:%M')}-{MARKET_END.strftime('%H:%M')} IST"
     )
     startup_token_test()
@@ -1035,10 +1272,13 @@ def main() -> int:
         if RUN_OUTSIDE_MARKET or market_is_open(moment) or args.once:
             try:
                 result = run_cycle()
-                print(
-                    f"[DONE] {result['timestamp']} options={result['option_rows']} "
-                    f"futures={result['future_rows']}"
-                )
+                if result.get("storage_paused"):
+                    print(f"[DONE] {result['timestamp']} storage_paused=True; no writes performed")
+                else:
+                    print(
+                        f"[DONE] {result['timestamp']} options={result['option_rows']} "
+                        f"futures={result['future_rows']}"
+                    )
             except Exception as exc:
                 print(f"[ERROR] Cycle failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         else:
